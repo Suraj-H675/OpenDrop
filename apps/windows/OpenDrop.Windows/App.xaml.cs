@@ -13,7 +13,7 @@ public partial class App : Application
 
     public App() { InitializeComponent(); }
 
-    protected override void OnLaunched(LaunchActivatedEventArgs args)
+    protected override void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
     {
         _window = new Window();
         var panel = new StackPanel { Spacing = 12, Padding = new Thickness(24) };
