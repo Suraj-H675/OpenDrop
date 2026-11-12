@@ -121,6 +121,29 @@ jobs:
           & $env:OPENDROP_MSBUILD apps/windows/OpenDrop.Windows/OpenDrop.Windows.csproj /t:Restore /p:Platform=x64 /p:RuntimeIdentifier=win-x64 /verbosity:minimal
           if ($LASTEXITCODE -ne 0) { throw 'NuGet / WinUI restore failed' }
 
+      - name: Verify effective WinUI single-project MSIX settings
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $project = 'apps/windows/OpenDrop.Windows/OpenDrop.Windows.csproj'
+          # Evaluate the same configuration passed to Build, without running a target.
+          $evaluation = @(& $env:OPENDROP_MSBUILD $project /p:Configuration=Release /p:Platform=x64 /p:RuntimeIdentifier=win-x64 /p:GenerateAppxPackageOnBuild=true /p:AppxBundle=Never /p:AppxPackageSigningEnabled=false '-getProperty:WindowsPackageType,EnableMsixTooling,AppxPackage,GenerateAppxPackageOnBuild' '-getItem:AppxManifest')
+          if ($LASTEXITCODE -ne 0) { throw 'MSBuild packaging configuration evaluation failed' }
+          $configuration = ($evaluation -join "`n" | ConvertFrom-Json -ErrorAction Stop)
+          if ($configuration.Properties.WindowsPackageType -ne 'MSIX' -or
+              $configuration.Properties.EnableMsixTooling -ne 'true' -or
+              $configuration.Properties.AppxPackage -ne 'true' -or
+              $configuration.Properties.GenerateAppxPackageOnBuild -ne 'true') {
+            throw 'Evaluated single-project MSIX properties are not correct'
+          }
+          $manifests = @($configuration.Items.AppxManifest)
+          if ($manifests.Count -ne 1) { throw "Expected exactly one AppxManifest item; got $($manifests.Count)" }
+          $expectedManifest = (Resolve-Path -LiteralPath 'apps/windows/packaging/Package.appxmanifest').Path
+          if (-not [string]::Equals($manifests[0].FullPath, $expectedManifest, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'AppxManifest item does not resolve to the reviewed package manifest'
+          }
+          Write-Host 'Effective MSIX configuration verified: WindowsPackageType=MSIX, EnableMsixTooling=true, AppxPackage=true.'
+          Write-Host 'Exactly one AppxManifest item resolves to the reviewed Package.appxmanifest.'
+
       - name: Build native WinUI app and unsigned test MSIX
         run: |
           $ErrorActionPreference = 'Stop'
