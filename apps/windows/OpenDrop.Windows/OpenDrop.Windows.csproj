@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.22000.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.22000.0</TargetPlatformMinVersion>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackageType>MSIX</WindowsPackageType>
+    <WindowsAppSDKSelfContained>false</WindowsAppSDKSelfContained>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <RootNamespace>OpenDrop.Windows</RootNamespace>
+    <AppxManifest>../packaging/Package.appxmanifest</AppxManifest>
+    <Nullable>enable</Nullable>
+    <!-- Built separately with the Windows x64 CMake toolchain; packaged at the
+         MSIX root to match the manifest's COM SurrogateServer Path. -->
+    <OpenDropExplorerDll Condition="'$(OpenDropExplorerDll)' == ''">$(MSBuildThisFileDirectory)..\explorer\build\Release\OpenDropExplorer.dll</OpenDropExplorerDll>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.6.4" />
+    <Content Include="$(OpenDropExplorerDll)" Link="OpenDropExplorer.dll" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(MSBuildThisFileDirectory)..\packaging\Assets\StoreLogo.png" Link="Assets\StoreLogo.png" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(MSBuildThisFileDirectory)..\packaging\Assets\Square150x150Logo.png" Link="Assets\Square150x150Logo.png" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(MSBuildThisFileDirectory)..\packaging\Assets\Square44x44Logo.png" Link="Assets\Square44x44Logo.png" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="ValidateOpenDropPackageInputs" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(OpenDropExplorerDll)')" Text="Build the x64 Explorer COM DLL first: $(OpenDropExplorerDll)" />
+    <Error Condition="!Exists('$(MSBuildThisFileDirectory)..\packaging\Assets\StoreLogo.png')" Text="Missing MSIX StoreLogo.png in apps/windows/packaging/Assets." />
+    <Error Condition="!Exists('$(MSBuildThisFileDirectory)..\packaging\Assets\Square150x150Logo.png')" Text="Missing MSIX Square150x150Logo.png in apps/windows/packaging/Assets." />
+    <Error Condition="!Exists('$(MSBuildThisFileDirectory)..\packaging\Assets\Square44x44Logo.png')" Text="Missing MSIX Square44x44Logo.png in apps/windows/packaging/Assets." />
+  </Target>
+</Project>

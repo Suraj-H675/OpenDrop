@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.21)
+project(OpenDropExplorer LANGUAGES CXX)
+if(NOT WIN32)
+    message(FATAL_ERROR "Explorer DLL requires a genuine Windows SDK toolchain")
+endif()
+add_library(OpenDropExplorer SHARED OpenDropExplorerCommand.cpp)
+target_compile_features(OpenDropExplorer PRIVATE cxx_std_17)
+target_link_libraries(OpenDropExplorer PRIVATE ole32 shell32 shlwapi)

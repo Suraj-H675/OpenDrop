@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Service
+MimeType=all/allfiles;
+X-KDE-Protocols=file
+Actions=OpenDropShare;
+
+[Desktop Action OpenDropShare]
+Name=Share with OpenDrop
+Icon=opendrop
+Exec=opendrop-share %F

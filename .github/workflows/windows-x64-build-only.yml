@@ -1,0 +1,151 @@
+# P1-A: manual SOURCE-COMPILATION gate only; not release packaging or OS acceptance.
+# There is deliberately no push/pull_request/schedule trigger and no artifact upload.
+name: Windows x64 build-only (unsigned MSIX)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opendrop-windows-x64-manual
+  cancel-in-progress: false
+
+jobs:
+  windows-x64:
+    # windows-2025 currently resolves to VS2026. This first gate requires the
+    # existing VS2022/CMake generator and pinned Windows App SDK 2.6.4.
+    runs-on: windows-2022
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out reviewed public source only
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Refuse any checked-in private files or modified test artwork
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in @('AGENTS.md', '.opendrop-private', 'private', 'research')) {
+            if (Test-Path -LiteralPath $path) { throw "Forbidden public source path: $path" }
+          }
+          $publicFiles = @(git ls-files)
+          if ($LASTEXITCODE -ne 0) { throw 'Git tracked-file inventory failed' }
+          foreach ($file in $publicFiles) {
+            if ($file -match '(^|/)(AGENTS\.md|\.opendrop-private|\.kotlin|private|research)(/|$)' -or
+                $file -match '(?i)\.(pem|pfx|jks|keystore|log|apk|aab|msix|msixbundle|appx|appxbundle)$' -or
+                $file -match '(?i)(^|/)(00_READ_FIRST|01_PRODUCT_CHARTER|02_LEVEL1_FEATURE_CONTRACT|03_FIGMA_DESIGN_BRIEF|04_TECH_FEASIBILITY|05_ENGINEERING_STANDARD|06_CODEX_STACKS_TIMEOUTS|07_CHATGPT_MASTER_WORKFLOW|08_ACCEPTANCE_MILESTONES|09_DECISION_REGISTER|10_PROVENANCE_HANDOFF)\.md$') {
+              throw "Forbidden source file unexpectedly tracked: $file"
+            }
+          }
+          $assets = @{
+            'StoreLogo.png' = '59e3e787cf9d71e80ab086b09c3e38b80c16977e6a32c9be6a97cff42cbf06c9'
+            'Square150x150Logo.png' = 'f8151d63b4e3337d33ae13d4f05bd483f6b1d92b8813e32ba2c1a073829119d4'
+            'Square44x44Logo.png' = 'd1a831aa77a34380d575713336c853ee7915825b318ae55b169bc45a612bc199'
+          }
+          foreach ($file in $assets.Keys) {
+            $path = Join-Path 'apps/windows/packaging/Assets' $file
+            if (-not (Test-Path -LiteralPath $path)) { throw "Missing build-only asset: $path" }
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+            if ($hash -ne $assets[$file]) { throw "Unreviewed asset change: $path" }
+          }
+          if (-not (Test-Path 'apps/windows/packaging/Assets/README.md')) {
+            throw 'Missing mandatory TEST ONLY artwork disclosure'
+          }
+
+      - name: Verify VS2022, MSBuild, SDK and .NET 8 tools
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Runner image: $env:ImageOS / $env:ImageVersion"
+          dotnet --list-sdks
+          if ($LASTEXITCODE -ne 0) { throw '.NET inventory failed' }
+          $vswhere = Join-Path "${env:ProgramFiles(x86)}" 'Microsoft Visual Studio/Installer/vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere)) { throw 'vswhere.exe not found' }
+          $vs = & $vswhere -products '*' -version '[17.0,18.0)' -requires Microsoft.Component.MSBuild -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $vs) { throw 'VS2022 MSBuild not installed' }
+          $msbuild = Join-Path ($vs | Select-Object -First 1) 'MSBuild/Current/Bin/MSBuild.exe'
+          if (-not (Test-Path -LiteralPath $msbuild)) { throw 'MSBuild.exe not found' }
+          $sdkBin = Join-Path "${env:ProgramFiles(x86)}" 'Windows Kits/10/bin'
+          $makeappx = Get-ChildItem -LiteralPath $sdkBin -Directory |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName 'x64/makeappx.exe' } |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
+          if (-not $makeappx) { throw 'Windows SDK x64 makeappx.exe missing' }
+          Write-Host "VS2022: $vs"
+          Write-Host "MSBuild: $msbuild"
+          Write-Host "Windows SDK MakeAppx: $makeappx"
+          "OPENDROP_MSBUILD=$msbuild" >> $env:GITHUB_ENV
+          "OPENDROP_MAKEAPPX=$makeappx" >> $env:GITHUB_ENV
+
+      - name: Build actual x64 Explorer COM DLL using MSVC
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S apps/windows/explorer -B apps/windows/explorer/build -G 'Visual Studio 17 2022' -A x64
+          if ($LASTEXITCODE -ne 0) { throw 'CMake VS2022 configuration failed' }
+          cmake --build apps/windows/explorer/build --config Release --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'Explorer COM compilation failed' }
+          $dll = 'apps/windows/explorer/build/Release/OpenDropExplorer.dll'
+          if (-not (Test-Path -LiteralPath $dll)) { throw 'Compiled x64 Explorer DLL missing' }
+          Write-Host "Compiled COM DLL: $dll"
+
+      - name: Restore pinned WinUI 3 / Windows App SDK 2.6.4
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:OPENDROP_MSBUILD apps/windows/OpenDrop.Windows/OpenDrop.Windows.csproj /t:Restore /p:Platform=x64 /p:RuntimeIdentifier=win-x64 /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { throw 'NuGet / WinUI restore failed' }
+
+      - name: Build native WinUI app and unsigned test MSIX
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:OPENDROP_MSBUILD apps/windows/OpenDrop.Windows/OpenDrop.Windows.csproj /t:Build /p:Configuration=Release /p:Platform=x64 /p:RuntimeIdentifier=win-x64 /p:GenerateAppxPackageOnBuild=true /p:AppxBundle=Never /p:AppxPackageSigningEnabled=false /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { throw 'WinUI 3 x64/MSIX compilation failed' }
+
+      - name: Inspect actual unsigned MSIX payload and registrations
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packages = @(Get-ChildItem -LiteralPath 'apps/windows/OpenDrop.Windows' -Filter '*.msix' -Recurse -File)
+          if ($packages.Count -ne 1) { throw "Expected exactly one unsigned .msix; got $($packages.Count)" }
+          $package = $packages[0]
+          $unpack = Join-Path $env:RUNNER_TEMP 'opendrop-msix-inspect'
+          & $env:OPENDROP_MAKEAPPX unpack /p $package.FullName /d $unpack /o
+          if ($LASTEXITCODE -ne 0) { throw 'MakeAppx unpack/structural validation failed' }
+          foreach ($relative in @(
+            'AppxManifest.xml',
+            'OpenDrop.Windows.exe',
+            'OpenDropExplorer.dll',
+            'Assets/StoreLogo.png',
+            'Assets/Square150x150Logo.png',
+            'Assets/Square44x44Logo.png'
+          )) {
+            if (-not (Test-Path -LiteralPath (Join-Path $unpack $relative))) {
+              throw "Missing required MSIX root payload: $relative"
+            }
+          }
+          [xml]$manifest = Get-Content -LiteralPath (Join-Path $unpack 'AppxManifest.xml') -Raw
+          $ns = [System.Xml.XmlNamespaceManager]::new($manifest.NameTable)
+          $ns.AddNamespace('f', 'http://schemas.microsoft.com/appx/manifest/foundation/windows10')
+          $ns.AddNamespace('uap', 'http://schemas.microsoft.com/appx/manifest/uap/windows10')
+          $ns.AddNamespace('com', 'http://schemas.microsoft.com/appx/manifest/com/windows10')
+          $ns.AddNamespace('desktop5', 'http://schemas.microsoft.com/appx/manifest/desktop/windows10/5')
+          $identity = $manifest.SelectSingleNode('//f:Identity', $ns)
+          $cls = $manifest.SelectSingleNode('//com:Class', $ns)
+          $verb = $manifest.SelectSingleNode('//desktop5:Verb', $ns)
+          $share = $manifest.SelectSingleNode("//uap:Extension[@Category='windows.shareTarget']", $ns)
+          if (-not $identity -or $identity.ProcessorArchitecture -ne 'x64' -or $identity.Name -ne 'org.opendrop.OpenDrop') {
+            throw 'Unexpected MSIX identity/CPU architecture'
+          }
+          if (-not $cls -or -not $verb -or -not $share) { throw 'Missing Share Target or COM/Explorer registration' }
+          if ($cls.Path -ne 'OpenDropExplorer.dll' -or $cls.Id -ne $verb.Clsid -or
+              $cls.Id -ne 'AB75604E-1230-4420-8208-20FD88C8CB15') {
+            throw 'Packaged Explorer COM class/path/verb mismatch'
+          }
+          Write-Host "Unsigned test MSIX inspected: $($package.Name), $($package.Length) bytes"
+          Write-Host "SHA-256: $((Get-FileHash -Algorithm SHA256 -LiteralPath $package.FullName).Hash)"
+          Write-Host 'C++ DLL, WinUI executable, TEST ONLY artwork, Share Target and COM Explorer registrations PRESENT.'
+          Write-Host 'BUILD-ONLY: no install, GUI activation, signing or artifact upload.'

@@ -1,0 +1,57 @@
+# OpenDrop private development material — NEVER commit or push.
+/.opendrop-private/
+/AGENTS.md
+**/AGENTS.md
+**/.opendrop-private/
+/private/
+/research/
+/ASH_*.md
+/01_ASH_CHARTER.md
+/02_ENGINEERING_STANDARD.md
+/03_EXECUTION_SUBAGENTS_AND_TIMEOUTS.md
+
+# Secrets and machine-local credentials (never store keys in source).
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.key
+**/local-secrets/
+
+# Build outputs / local editor and OS state.
+/target/
+**/target/
+**/build/
+**/bin/
+**/obj/
+**/.gradle/
+**/.kotlin/
+**/.vs/
+**/TestResults/
+**/AppPackages/
+**/BundleArtifacts/
+*.appx
+*.appxbundle
+*.appxupload
+*.msix
+*.msixbundle
+*.msixupload
+*.snk
+**/.dart_tool/
+**/.flutter-plugins*
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Test-local state, never committed as production examples.
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db-journal
+*.partial

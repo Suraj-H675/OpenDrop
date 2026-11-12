@@ -1,0 +1,15 @@
+[package]
+name = "opendrop-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Offline cached, mature SQLite API; review/update at a deliberate dependency gate.
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+sha2 = "=0.10.9"
+rustls = { version = "=0.23.45", default-features = false, features = ["std", "ring"] }
+thiserror = "=2.0.21"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
