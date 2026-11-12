@@ -1,41 +1,45 @@
-# Windows 11 x64 native build gate (P1-A)
+# Windows x64 hosted build gate (P1-A passed; Windows 11 runtime pending)
 
-This is **source/build preparation only**, not proof of a Windows build, MSIX
-installation, Share Target activation, or Explorer integration. Both Windows
-entry points deliberately fail closed until OpenDrop has a secure transfer queue.
+The Windows x64 **source compilation and unsigned MSIX structural gate PASSED**
+on GitHub-hosted Windows Server 2022. This is **not** proof of installation on
+Windows 11, Share Target activation, Explorer runtime integration or working
+file transfers. Both Windows entry points deliberately fail closed until
+OpenDrop has a secure transfer queue.
 
-## First compilation route: GitHub Actions hosted Windows x64 (not executed)
+## Verified compilation route: GitHub Actions hosted Windows x64
 
-The owner has **no accessible physical Windows PC**. The ready-to-review
+The owner has **no accessible physical Windows PC**. The reviewed
 `.github/workflows/windows-x64-build-only.yml` uses standard **`windows-2022`**
-(Windows **Server** 2022 x64), deliberately not `windows-2025`: as of November
-2026 GitHub's documented `windows-2025` label routes to a **Visual Studio
-2026** image, while the existing CMake generator and COM source setup use
-**Visual Studio 2022**. The Windows Server 2022 inventory includes VS2022,
-MSVC, Windows SDK 10.0.26100, CMake and .NET8. Do not silently change project
-framework or SDK pins simply to use the newer runner label.
-This can establish **compilation/package evidence only**; hosted Server CI is
-not a Windows 11 Explorer/Share Target GUI acceptance test and cannot verify
-physical Wi-Fi sharing. No GitHub Actions workflow has been created or run.
+(Windows **Server** 2022 x64) with Visual Studio 2022/MSBuild, MSVC,
+Windows SDK 10.0.26100, CMake and .NET 8, as confirmed by actual hosted logs.
+Do not silently change project framework or SDK pins simply to use a newer
+runner label. Hosted Server CI establishes **compilation/package evidence only**,
+not Windows 11 Explorer/Share Target GUI or physical Wi-Fi acceptance.
 
-When separately authorized to commit/push **production-only** sources and add
-CI, use read-only `contents: read` permissions, a manual `workflow_dispatch`
-trigger for the initial gate, no signing secrets, and `windows-2022` with
-VS2022/MSBuild setup. The first workflow uses SHA-pinned checkout and does
-**not upload any artifact**. It compiles CMake x64 COM, restores pinned WinUI3,
-builds an **unsigned** MSIX and unpacks it with MakeAppx for entry/registration
-checks. Do not publish `.opendrop-private`, `AGENTS.md`, signing keys,
+**Accepted P1-A evidence:** public source commit
+[`dca454e987aa00047eb043dff78a6986b28ef5b1`](https://github.com/Suraj-H675/OpenDrop/commit/dca454e987aa00047eb043dff78a6986b28ef5b1)
+and [manual Windows build run 43242232569](https://github.com/Suraj-H675/OpenDrop/actions/runs/43242232569)
+(`workflow_dispatch`, attempt 1, **completed/success**). Real Windows tooling
+compiled the x64 Explorer COM DLL, verified both exact exports, restored pinned
+Windows App SDK 2.6.4, compiled WinUI 3, built an **unsigned** x64 MSIX,
+unpacked it with MakeAppx, and checked its executable, Explorer DLL, three
+**TEST ONLY** images, package identity, Share Target and Explorer COM
+registration structure. The four earlier failed workflow runs remain valid
+development evidence; passing structural registration checks does not prove
+that Windows 11 will activate those registrations at runtime.
+
+The existing workflow retains read-only `contents: read` permissions, a manual
+`workflow_dispatch` trigger, no signing secrets, SHA-pinned checkout and
+**no artifact upload**. Do not publish `.opendrop-private`, `AGENTS.md`, signing keys,
 local evidence, or any debug-only credentials. A successful unsigned package
 is **not installable release acceptance**; publisher/certificate identity and
 Windows 11 GUI tests require later separate decisions. The specific runner's
 installed VS/SDK versions should be logged at job start because images change.
 
-Billing: GitHub currently lists standard Windows 2-core x64 compute at
-**$0.010 per rounded job-minute** for chargeable usage; eligible private-repo
-usage draws from the account's monthly included compute allowance, while
-standard GitHub-hosted runners are free for public repositories. Check the
-actual repo visibility, current budget and billing limits before authorizing
-the first run. No CI, upload, paid service or signing operation was used here.
+Billing: GitHub documents standard GitHub-hosted runners as free for public
+repositories. Recheck repository visibility and billing policies before future
+CI authorization. The accepted build used a standard public hosted runner;
+no paid runner, artifact upload, release or signing operation was used.
 
 ## Build prerequisites (hosted Server CI or later authorized Windows 11 host)
 
@@ -85,9 +89,9 @@ On the Windows runner, inspect the actual `.msix` with Windows SDK `MakeAppx`:
 confirm root `OpenDropExplorer.dll`, `Assets/*`, application executable, the
 `windows.shareTarget`, `windows.comServer` and `windows.fileExplorerContextMenus`
 registrations, and the CLSID agreement. Validate the manifest with the real
-Windows SDK/MSIX tooling; XML well-formedness alone is insufficient. Confirm
-that the Windows App SDK version, WinUI APIs and package project build cleanly;
-this is **not yet demonstrated**. Decide publisher identity and signing as a
+Windows SDK/MSIX tooling; XML well-formedness alone is insufficient. The
+accepted P1-A hosted run performed these checks successfully. Decide publisher
+identity and signing as a
 separate gate before any authorized install. Windows Share Target and Explorer
 entry points require later *owner-operated* GUI testing.
 

@@ -9,7 +9,9 @@ targets.
 foundations and native platform integration work. It is **not yet a finished
 or security-audited file-sharing application**. A successfully built Android
 debug APK or compiled Linux component is not proof of end-to-end production
-sharing. Windows packaging and native OS activation still require validation.
+sharing. Windows x64 compilation and unsigned MSIX package structure passed
+hosted CI; installation, native OS activation, Explorer runtime behavior and
+end-to-end Windows sharing are still untested.
 
 ## Scope and compatibility
 
