@@ -148,7 +148,9 @@ public:
 };
 } // namespace
 
-extern "C" __declspec(dllexport) HRESULT __stdcall DllGetClassObject(REFCLSID clsid, REFIID iid, LPVOID *object) {
+// Match combaseapi.h's STDAPI declaration (C linkage and COM calling convention).
+// The two public entrypoint names are exported explicitly by OpenDropExplorer.def.
+STDAPI DllGetClassObject(REFCLSID clsid, REFIID iid, LPVOID *object) {
     if (clsid != kOpenDropCommand) return CLASS_E_CLASSNOTAVAILABLE;
     if (!object) return E_POINTER;
     auto *factory = new (std::nothrow) CommandFactory();
@@ -157,6 +159,6 @@ extern "C" __declspec(dllexport) HRESULT __stdcall DllGetClassObject(REFCLSID cl
     factory->Release();
     return result;
 }
-extern "C" __declspec(dllexport) HRESULT __stdcall DllCanUnloadNow() {
+STDAPI DllCanUnloadNow() {
     return gObjects.load() == 0 && gLocks.load() == 0 ? S_OK : S_FALSE;
 }

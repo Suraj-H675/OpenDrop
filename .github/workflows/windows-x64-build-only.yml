@@ -70,6 +70,13 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or -not $vs) { throw 'VS2022 MSBuild not installed' }
           $msbuild = Join-Path ($vs | Select-Object -First 1) 'MSBuild/Current/Bin/MSBuild.exe'
           if (-not (Test-Path -LiteralPath $msbuild)) { throw 'MSBuild.exe not found' }
+          $vcTools = Join-Path ($vs | Select-Object -First 1) 'VC/Tools/MSVC'
+          $dumpbin = Get-ChildItem -LiteralPath $vcTools -Directory |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName 'bin/Hostx64/x64/dumpbin.exe' } |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
+          if (-not $dumpbin) { throw 'VS2022 x64 dumpbin.exe not found' }
           $sdkBin = Join-Path "${env:ProgramFiles(x86)}" 'Windows Kits/10/bin'
           $makeappx = Get-ChildItem -LiteralPath $sdkBin -Directory |
             Sort-Object Name -Descending |
@@ -79,8 +86,10 @@ jobs:
           if (-not $makeappx) { throw 'Windows SDK x64 makeappx.exe missing' }
           Write-Host "VS2022: $vs"
           Write-Host "MSBuild: $msbuild"
+          Write-Host "VS2022 Dumpbin: $dumpbin"
           Write-Host "Windows SDK MakeAppx: $makeappx"
           "OPENDROP_MSBUILD=$msbuild" >> $env:GITHUB_ENV
+          "OPENDROP_DUMPBIN=$dumpbin" >> $env:GITHUB_ENV
           "OPENDROP_MAKEAPPX=$makeappx" >> $env:GITHUB_ENV
 
       - name: Build actual x64 Explorer COM DLL using MSVC
@@ -93,6 +102,18 @@ jobs:
           $dll = 'apps/windows/explorer/build/Release/OpenDropExplorer.dll'
           if (-not (Test-Path -LiteralPath $dll)) { throw 'Compiled x64 Explorer DLL missing' }
           Write-Host "Compiled COM DLL: $dll"
+          # Match complete dumpbin export-table rows, not similarly named or
+          # decorated symbols, import names, explanatory text, or forwarders.
+          $exports = @(& $env:OPENDROP_DUMPBIN /nologo /exports $dll)
+          if ($LASTEXITCODE -ne 0) { throw 'VS2022 dumpbin /exports failed' }
+          foreach ($name in @('DllGetClassObject', 'DllCanUnloadNow')) {
+            $symbol = [regex]::Escape($name)
+            $exportRows = @($exports | Where-Object {
+              $_ -cmatch "^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+$symbol\s*$"
+            })
+            if ($exportRows.Count -ne 1) { throw "Missing, decorated or ambiguous DLL export: $name" }
+            Write-Host "Verified exact COM DLL export: $name"
+          }
 
       - name: Restore pinned WinUI 3 / Windows App SDK 2.6.4
         run: |

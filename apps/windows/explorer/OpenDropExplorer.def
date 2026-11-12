@@ -1,0 +1,4 @@
+LIBRARY OpenDropExplorer
+EXPORTS
+    DllGetClassObject
+    DllCanUnloadNow
