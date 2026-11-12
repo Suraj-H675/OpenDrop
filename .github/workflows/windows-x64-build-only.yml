@@ -153,9 +153,38 @@ jobs:
       - name: Inspect actual unsigned MSIX payload and registrations
         run: |
           $ErrorActionPreference = 'Stop'
-          $packages = @(Get-ChildItem -LiteralPath 'apps/windows/OpenDrop.Windows' -Filter '*.msix' -Recurse -File)
-          if ($packages.Count -ne 1) { throw "Expected exactly one unsigned .msix; got $($packages.Count)" }
+          $projectRoot = 'apps/windows/OpenDrop.Windows'
+          [xml]$sourceManifest = Get-Content -LiteralPath 'apps/windows/packaging/Package.appxmanifest' -Raw
+          $sourceNs = [System.Xml.XmlNamespaceManager]::new($sourceManifest.NameTable)
+          $sourceNs.AddNamespace('f', 'http://schemas.microsoft.com/appx/manifest/foundation/windows10')
+          $sourceIdentity = $sourceManifest.SelectSingleNode('/f:Package/f:Identity', $sourceNs)
+          if (-not $sourceIdentity -or $sourceIdentity.GetAttribute('Name') -ne 'org.opendrop.OpenDrop' -or
+              $sourceIdentity.GetAttribute('ProcessorArchitecture') -ne 'x64') {
+            throw 'Unexpected reviewed source MSIX identity or architecture'
+          }
+          $version = $sourceIdentity.GetAttribute('Version')
+          if ($version -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw 'Invalid reviewed source MSIX version' }
+
+          # List all candidates for diagnosis, but select ONLY the actual
+          # AppPackages test output observed in the successful MSBuild log.
+          $projectPath = (Resolve-Path -LiteralPath $projectRoot).Path
+          $candidates = @(Get-ChildItem -LiteralPath $projectRoot -Filter '*.msix' -Recurse -File)
+          foreach ($candidate in $candidates) {
+            $relative = [System.IO.Path]::GetRelativePath($projectPath, $candidate.FullName)
+            Write-Host "MSIX candidate: $relative ($($candidate.Length) bytes)"
+          }
+          $packageDir = Join-Path $projectRoot "AppPackages/OpenDrop.Windows_${version}_x64_Test"
+          if (-not (Test-Path -LiteralPath $packageDir -PathType Container)) {
+            throw "Expected OpenDrop x64 AppPackages test output directory missing: $packageDir"
+          }
+          $packages = @(Get-ChildItem -LiteralPath $packageDir -Filter '*.msix' -File)
+          if ($packages.Count -ne 1) { throw "Expected exactly one MSIX in OpenDrop x64 test output; got $($packages.Count)" }
           $package = $packages[0]
+          $expectedName = "OpenDrop.Windows_${version}_x64.msix"
+          if ($package.Name -cne $expectedName -or $package.Length -le 0) {
+            throw "Incorrect or empty OpenDrop x64 package: $($package.Name) ($($package.Length) bytes)"
+          }
+          Write-Host "Selected reviewed OpenDrop x64 package: $($package.Name) ($($package.Length) bytes)"
           $unpack = Join-Path $env:RUNNER_TEMP 'opendrop-msix-inspect'
           & $env:OPENDROP_MAKEAPPX unpack /p $package.FullName /d $unpack /o
           if ($LASTEXITCODE -ne 0) { throw 'MakeAppx unpack/structural validation failed' }
@@ -181,7 +210,8 @@ jobs:
           $cls = $manifest.SelectSingleNode('//com:Class', $ns)
           $verb = $manifest.SelectSingleNode('//desktop5:Verb', $ns)
           $share = $manifest.SelectSingleNode("//uap:Extension[@Category='windows.shareTarget']", $ns)
-          if (-not $identity -or $identity.ProcessorArchitecture -ne 'x64' -or $identity.Name -ne 'org.opendrop.OpenDrop') {
+          if (-not $identity -or $identity.ProcessorArchitecture -ne 'x64' -or $identity.GetAttribute('Name') -ne 'org.opendrop.OpenDrop' -or
+              $identity.GetAttribute('Version') -ne $version) {
             throw 'Unexpected MSIX identity/CPU architecture'
           }
           if (-not $cls -or -not $verb -or -not $share) { throw 'Missing Share Target or COM/Explorer registration' }
