@@ -66,7 +66,10 @@ IncomingOfferDialog::IncomingOfferDialog(IncomingOfferView offer, QWidget *paren
     buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("Accept file"));
     buttons->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("Decline"));
     layout->addWidget(buttons);
-    connect(buttons, &QDialogButtonBox::accepted, this, [this]() {
+    // Only this widget's actual Accept button activation changes the local
+    // UI result. Merely calling QDialog::accept() cannot return a usable
+    // owner-action selection through selectedDirectoryAfterAcceptance().
+    connect(buttons->button(QDialogButtonBox::Ok), &QPushButton::clicked, this, [this]() {
         if (selectedDirectory_.isEmpty() || !isVisible()) {
             return; // no destination was selected by the owner
         }

@@ -211,6 +211,7 @@ name = "opendrop-core"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "rustix",
  "rustls",
  "sha2",
  "tempfile",

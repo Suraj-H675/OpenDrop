@@ -41,8 +41,21 @@ jobs:
           cargo --version
           rustfmt --version
 
+      - name: Install disposable runner Qt 6 and logind build headers
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends qt6-base-dev libsystemd-dev
+
       - name: Verify Rust formatting
         run: cargo fmt --all -- --check
 
       - name: Compile and test shared core and Linux receiver
         run: cargo test -p opendrop-core -p opendrop-linux-receiver --locked
+
+      - name: Compile and test native Qt owner dialog (headless synthetic)
+        shell: bash
+        run: |
+          cmake -S apps/linux/receiver/ui -B "$RUNNER_TEMP/opendrop-qt-owner" -DOPENDROP_BUILD_QT_TESTS=ON -DCMAKE_BUILD_TYPE=Debug
+          cmake --build "$RUNNER_TEMP/opendrop-qt-owner" --parallel 2
+          ctest --test-dir "$RUNNER_TEMP/opendrop-qt-owner" --output-on-failure

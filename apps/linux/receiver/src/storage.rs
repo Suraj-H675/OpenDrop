@@ -146,6 +146,21 @@ impl LinuxReceiverStorage {
         &self.destination_label
     }
 
+    /// Rebind a locally selected Qt destination to a PINNED owner-verified
+    /// directory descriptor. Both the stage root lock and its inode survive
+    /// the transition; the old directory path is no longer used for writes.
+    /// Remote offer names never select this directory.
+    pub fn with_owner_selected_destination(&self, selected: &Path) -> Result<Self, Error> {
+        let destination = open_owner_directory(selected, false)?;
+        Ok(Self {
+            directories: Arc::new(OwnedDirectories {
+                stage: self.directories.stage.try_clone()?,
+                destination,
+            }),
+            destination_label: Arc::new(selected.to_owned()),
+        })
+    }
+
     pub fn allocate(
         &self,
         offer: &FileOffer,
@@ -215,10 +230,11 @@ impl LinuxReceiverStorage {
     /// silently marked committed. A future authenticated session must use
     /// the existing AuthorizedOffer::reconcile_intent transaction API.
     pub fn recover_before_listen(&self, journal: &Journal) -> Result<RestartReport, Error> {
+        let recovery = journal.local_linux_recovery(&self.directories.stage)?;
         inventory::reconcile(
             &self.directories.stage,
             &self.directories.destination,
-            journal,
+            &recovery,
         )
     }
 }
@@ -474,6 +490,37 @@ mod tests {
             std::fs::read(dest.path().join("report.txt")).unwrap(),
             b"hello world"
         );
+    }
+
+    #[test]
+    fn qt_selected_destination_is_pinned_and_cannot_redirect_after_rename() {
+        let private = private_stage_root();
+        let first = tempfile::tempdir().unwrap();
+        let choices = tempfile::tempdir().unwrap();
+        let selected = choices.path().join("approved");
+        let moved = choices.path().join("original-inode");
+        std::fs::create_dir(&selected).unwrap();
+        let original = LinuxReceiverStorage::open_private(private.path(), first.path()).unwrap();
+        let approved = original.with_owner_selected_destination(&selected).unwrap();
+        assert_eq!(approved.owner_destination_display(), selected.as_path());
+
+        // The chosen directory can be renamed by its owner while the
+        // authenticated stream runs. The publisher must use the PINNED
+        // descriptor, never reopen that string during publication.
+        std::fs::rename(&selected, &moved).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+        let offered = offer(b"owner approved", "immutable.txt");
+        let (mut stage, mut publisher) = approved.allocate(&offered).unwrap();
+        stage.append_chunk(b"owner approved").unwrap();
+        stage.sync_staged().unwrap();
+        publisher.publish(&offered, "immutable.txt").unwrap();
+        stage.discard().unwrap();
+        assert_eq!(
+            std::fs::read(moved.join("immutable.txt")).unwrap(),
+            b"owner approved"
+        );
+        assert!(!selected.join("immutable.txt").exists());
+        assert!(!first.path().join("immutable.txt").exists());
     }
 
     #[test]

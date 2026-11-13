@@ -7,6 +7,8 @@ use crate::policy::{self, PrivateVisibility, ReceiveDecision, Visibility};
 use crate::Error;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+use std::{fs::File, os::unix::fs::MetadataExt};
 
 /// Keep private peer trust, destination references and transfer metadata out
 /// of world-readable SQLite files. The owning platform must ALSO keep the
@@ -168,6 +170,30 @@ pub struct Journal {
     db: Connection,
 }
 
+/// Owner-local, read-only recovery authority tied to a pinned 0700 stage
+/// directory file descriptor. It cannot be constructed from network IDs,
+/// filenames, public IPC fields, or a caller-supplied approval boolean.
+/// This authority cannot mutate journal state or issue transfer receipts.
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+pub struct LinuxLocalRecovery<'a> {
+    journal: &'a Journal,
+    protected_stage: &'a File,
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+impl LinuxLocalRecovery<'_> {
+    pub fn phase_for_exact_offer(&self, offer: &FileOffer) -> Result<Option<Phase>, Error> {
+        let info = self.protected_stage.metadata()?;
+        if !info.is_dir()
+            || info.uid() != rustix::process::geteuid().as_raw()
+            || info.mode() & 0o077 != 0
+        {
+            return Err(Error::Unauthorized);
+        }
+        Ok(self.journal.require_offer(offer)?.map(|(phase, _)| phase))
+    }
+}
+
 // The persisted offer is deliberately compared field-by-field rather than
 // accepting a transfer ID alone as authorization for an existing receipt.
 type StoredOffer = (String, String, String, i64, String, String, Option<String>);
@@ -287,14 +313,25 @@ impl Journal {
         }))
     }
 
-    /// Read-only, exact-offer lookup for the Linux owner's offline startup
-    /// staging reconciliation. Deliberately exposes ONLY a journal phase,
-    /// not a destination path, receipt, trust mutation or recovery write.
-    /// The owning receiver must call this before opening any network listener
-    /// and must not forward it to peers or ordinary public IPC methods.
-    #[cfg(target_os = "linux")]
-    pub fn linux_local_recovery_phase(&self, offer: &FileOffer) -> Result<Option<Phase>, Error> {
-        Ok(self.require_offer(offer)?.map(|(phase, _)| phase))
+    /// Bind startup phase inspection to an existing pinned owner-private
+    /// staging directory (opened and locked by the native filesystem adapter).
+    /// No unauthenticated API takes a transfer ID and returns a raw phase.
+    #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+    pub fn local_linux_recovery<'a>(
+        &'a self,
+        private_stage: &'a File,
+    ) -> Result<LinuxLocalRecovery<'a>, Error> {
+        let info = private_stage.metadata()?;
+        if !info.is_dir()
+            || info.uid() != rustix::process::geteuid().as_raw()
+            || info.mode() & 0o077 != 0
+        {
+            return Err(Error::Unauthorized);
+        }
+        Ok(LinuxLocalRecovery {
+            journal: self,
+            protected_stage: private_stage,
+        })
     }
 
     /// INTERNAL commit-intent; public writes require AuthorizedOffer.
@@ -660,11 +697,19 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
     #[test]
     fn read_only_native_stage_recovery_has_exact_offer_and_phase_checks() {
+        use std::fs::File;
+        use std::os::unix::fs::PermissionsExt;
+
         let folder = tempfile::tempdir().unwrap();
         let mut journal = Journal::open(&folder.path().join("recovery.sqlite")).unwrap();
+        let private_stage = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let stage_fd = File::open(private_stage.path()).unwrap();
         let offer = FileOffer {
             id: TransferId::parse(&"1".repeat(32)).unwrap(),
             peer: KeyFingerprint::parse(&"2".repeat(64)).unwrap(),
@@ -673,22 +718,47 @@ mod tests {
             bytes: 1,
             sha256: Sha256Digest::parse(&"4".repeat(64)).unwrap(),
         };
-        assert_eq!(journal.linux_local_recovery_phase(&offer).unwrap(), None);
+        assert_eq!(
+            journal
+                .local_linux_recovery(&stage_fd)
+                .unwrap()
+                .phase_for_exact_offer(&offer)
+                .unwrap(),
+            None
+        );
         journal.reserve(&offer).unwrap();
         assert_eq!(
-            journal.linux_local_recovery_phase(&offer).unwrap(),
+            journal
+                .local_linux_recovery(&stage_fd)
+                .unwrap()
+                .phase_for_exact_offer(&offer)
+                .unwrap(),
             Some(Phase::Reserved)
         );
         let mut wrong = offer.clone();
         wrong.sha256 = Sha256Digest::parse(&"5".repeat(64)).unwrap();
-        assert!(journal.linux_local_recovery_phase(&wrong).is_err());
+        assert!(journal
+            .local_linux_recovery(&stage_fd)
+            .unwrap()
+            .phase_for_exact_offer(&wrong)
+            .is_err());
         journal
             .record_commit_intent(&offer, "recovery.txt")
             .unwrap();
         assert_eq!(
-            journal.linux_local_recovery_phase(&offer).unwrap(),
+            journal
+                .local_linux_recovery(&stage_fd)
+                .unwrap()
+                .phase_for_exact_offer(&offer)
+                .unwrap(),
             Some(Phase::CommitIntent)
         );
+        std::fs::set_permissions(private_stage.path(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert!(matches!(
+            journal.local_linux_recovery(&stage_fd),
+            Err(Error::Unauthorized)
+        ));
     }
 
     #[test]

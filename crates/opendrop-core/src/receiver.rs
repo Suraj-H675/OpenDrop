@@ -51,7 +51,8 @@ impl ReceiveState {
 /// A local destination capability. Its private constructor MUST be supplied
 /// later by a reviewed native adapter after genuine owner selection; not by a
 /// network handler, deserializer, CLI-supplied peer path or remote caller.
-/// No production constructor is currently available; publishing fails closed.
+/// Only the feature-gated in-process Qt owner ceremony can produce a lease;
+/// the constructor is crate-private, never in a network-facing API.
 ///
 /// ```compile_fail
 /// use opendrop_core::receiver::LocalDestinationLease;
@@ -59,11 +60,36 @@ impl ReceiveState {
 /// ```
 pub struct LocalDestinationLease {
     reference: String,
+    #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+    approved_directory: std::path::PathBuf,
+    #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+    session_offer_binding: [u8; 32],
 }
 
-// There is deliberately NO production constructor for this privileged
-// destination lease. The reviewed owner-controlled native UI boundary must
-// also bind the user's chosen destination before enabling publication.
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+impl LocalDestinationLease {
+    /// Internal constructor, only reachable through the security module's
+    /// Qt modal owner gesture. No public arbitrary path/approval constructor.
+    pub(crate) fn from_local_qt_owner_action(
+        offer: &FileOffer,
+        selected_directory: std::path::PathBuf,
+        binding: [u8; 32],
+    ) -> Result<Self, Error> {
+        offer.validate()?;
+        if !selected_directory.is_absolute() {
+            return Err(Error::Unauthorized);
+        }
+        Ok(Self {
+            reference: offer.name.clone(),
+            approved_directory: selected_directory,
+            session_offer_binding: binding,
+        })
+    }
+
+    pub fn owner_approved_directory(&self) -> &std::path::Path {
+        &self.approved_directory
+    }
+}
 
 /// Owned local staging capability. A native adapter must implement these
 /// operations on an owner-private temporary file, never on a path received
@@ -250,6 +276,16 @@ impl ReceiverCoordinator {
     ) -> Result<(), Error> {
         if self.state != ReceiveState::StreamVerified {
             return Err(Error::InvalidState);
+        }
+        #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+        if destination.reference != self.offer.name
+            || !crate::authorization::matches_native_lease(
+                &self.session,
+                &self.offer,
+                &destination.session_offer_binding,
+            )
+        {
+            return Err(Error::Unauthorized);
         }
         let authorized = self.authorization.as_ref().ok_or(Error::Unauthorized)?;
         // The existing AuthorizedOffer verifies the session/visibility

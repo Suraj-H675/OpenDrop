@@ -1,0 +1,143 @@
+#include "IncomingOfferDialog.hpp"
+
+#include <QApplication>
+#include <QCoreApplication>
+#include <QGuiApplication>
+#include <QThread>
+#include <QByteArray>
+
+#include <systemd/sd-login.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cstdlib>
+#include <cstddef>
+#include <cstring>
+#include <optional>
+#include <string>
+#include <utility>
+
+namespace {
+
+// This is a sanity check on the owner desktop process, NOT cryptographic
+// proof of physical presence. A same-UID malicious process can compromise
+// the trusted app process by other means; no network peer can reach this
+// function through the existing OpenDrop protocol or public IPC.
+struct OwnerSession {
+    std::string name;
+    std::string seat;
+    uid_t uid;
+};
+
+std::optional<OwnerSession> currentOwnerSession() {
+    char *sessionName = nullptr;
+    if (sd_pid_get_session(0, &sessionName) < 0 || !sessionName) {
+        std::free(sessionName);
+        return std::nullopt;
+    }
+    const std::string name(sessionName);
+    std::free(sessionName);
+
+    if (sd_session_is_active(name.c_str()) != 1) {
+        return std::nullopt;
+    }
+    uid_t uid = 0;
+    if (sd_session_get_uid(name.c_str(), &uid) < 0 || uid != geteuid()) {
+        return std::nullopt;
+    }
+    char *sessionType = nullptr;
+    if (sd_session_get_type(name.c_str(), &sessionType) < 0 || !sessionType) {
+        return std::nullopt;
+    }
+    const std::string type(sessionType);
+    std::free(sessionType);
+    if (type != "wayland" && type != "x11") {
+        return std::nullopt;
+    }
+    char *seat = nullptr;
+    if (sd_session_get_seat(name.c_str(), &seat) < 0 || !seat) {
+        return std::nullopt;
+    }
+    const std::string ownerSeat(seat);
+    std::free(seat);
+    if (ownerSeat.empty()) {
+        return std::nullopt;
+    }
+    return OwnerSession{name, ownerSeat, uid};
+}
+
+} // namespace
+
+// THIS IS NOT A CONSENT TICKET ISSUER. Only core Rust can create a ticket.
+// ABI is intentionally value-only, with no pointer to AuthenticatedSession,
+// exporter secrets, journal, Qt callbacks or privileged native capabilities.
+//  1 = owner used the dialog's Accept button with a destination
+//  0 = declined/dismissed/timed out
+// -1 = wrong process/session/GUI thread/invalid destination
+extern "C" int opendrop_qt_present_owner_consent(
+    const char *claimedDevice,
+    const char *peerFingerprint,
+    const char *transferId,
+    const char *fileName,
+    const char *fileSha256,
+    unsigned long long byteCount,
+    const char *initialDestination,
+    char *destinationOut,
+    size_t destinationCapacity) noexcept {
+    try {
+        if (!claimedDevice || !peerFingerprint || !transferId ||
+            !fileName || !fileSha256 || !initialDestination ||
+            !destinationOut || destinationCapacity < 2) {
+            return -1;
+        }
+        auto *app = qobject_cast<QApplication *>(QCoreApplication::instance());
+        if (!app || QThread::currentThread() != app->thread()) {
+            return -1;
+        }
+        const auto platform = QGuiApplication::platformName();
+        if (platform != QStringLiteral("wayland") &&
+            platform != QStringLiteral("xcb")) {
+            return -1;
+        }
+        const auto before = currentOwnerSession();
+        if (!before) {
+            return -1;
+        }
+        opendrop::IncomingOfferView details{
+            QString::fromUtf8(claimedDevice),
+            QString::fromUtf8(peerFingerprint),
+            QString::fromUtf8(transferId),
+            QString::fromUtf8(fileName),
+            QString::fromUtf8(fileSha256),
+            byteCount,
+            QString::fromUtf8(initialDestination)
+        };
+        opendrop::IncomingOfferDialog dialog(std::move(details));
+        if (dialog.exec() != QDialog::Accepted) {
+            return 0;
+        }
+        const auto after = currentOwnerSession();
+        if (!after || before->name != after->name ||
+            before->seat != after->seat || before->uid != after->uid) {
+            return -1;
+        }
+        // selectedDirectoryAfterAcceptance returns empty on reject, timer,
+        // or programmatic QDialog::accept() without its local button handler.
+        const auto destination = dialog.selectedDirectoryAfterAcceptance();
+        if (destination.isEmpty()) {
+            return -1;
+        }
+        const QByteArray bytes = destination.toUtf8();
+        if (bytes.isEmpty() ||
+            static_cast<size_t>(bytes.size()) >= destinationCapacity ||
+            bytes.contains('\0')) {
+            return -1;
+        }
+        std::memcpy(destinationOut, bytes.constData(),
+                    static_cast<size_t>(bytes.size()));
+        destinationOut[bytes.size()] = '\0';
+        return 1;
+    } catch (...) {
+        return -1;
+    }
+}

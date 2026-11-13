@@ -2,9 +2,9 @@
 //!
 //! Trust comes from the authenticated rustls TLS 1.3 peer certificate, not
 //! multicast claims, caller-supplied fingerprints, or UI-supplied booleans.
-//! LocalConsentBroker is strictly test-only. The real native GUI approval
-//! issuer does not yet exist and must remain private to this security module;
-//! neither a terminal nor network/public IPC is an acceptable fallback.
+//! LocalConsentBroker remains test-only. The native Linux Qt issuer is
+//! feature-gated, opens a real in-process desktop modal, and never accepts a
+//! caller-supplied approval boolean or raw IPC/terminal response.
 
 use crate::identity::{DeviceId, KeyFingerprint};
 use crate::journal::{DurablePublisher, FileOffer, Journal, Receipt, Snapshot};
@@ -13,9 +13,19 @@ use crate::Error;
 use rustls::server::ServerConnection;
 use rustls::ProtocolVersion;
 use sha2::{Digest, Sha256};
-#[cfg(test)]
+#[cfg(any(test, all(target_os = "linux", feature = "linux-qt-consent")))]
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+use std::{
+    ffi::{c_char, CString},
+    path::{Component, Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock,
+    },
+    time::Duration,
+};
 
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-OpenDrop-P1A-OfferAuthorization";
 
@@ -96,11 +106,9 @@ impl ConsentPrompt {
     }
 }
 
-/// Production Linux consent has no public issuer. The reviewed in-process Qt
-/// bridge must privately bind the exact session/offer/destination. A terminal,
-/// ordinary IPC, bool or raw token is not an acceptable approval source.
+/// No public terminal issuer; ticket creation stays in this security module.
+/// The Qt route makes the owner interact with the actual in-process dialog.
 ///
-/// A public terminal issuer must remain unresolvable:
 /// ```compile_fail
 /// use opendrop_core::authorization::confirm_linux_foreground_owner;
 /// ```
@@ -224,7 +232,7 @@ pub enum OfferDecision {
     AutoAccepted(AuthorizedOffer),
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(target_os = "linux", feature = "linux-qt-consent")))]
 fn consent_binding(session: &[u8; 32], device: &DeviceId, offer: &FileOffer) -> [u8; 32] {
     let mut hash = Sha256::new();
     for component in [
@@ -241,6 +249,255 @@ fn consent_binding(session: &[u8; 32], device: &DeviceId, offer: &FileOffer) -> 
         hash.update(component);
     }
     hash.finalize().into()
+}
+
+/// Only the receiver coordinator may compare a native lease against its
+/// immutable authenticated session and exact offered bytes.
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+pub(crate) fn matches_native_lease(
+    session: &AuthenticatedSession,
+    offer: &FileOffer,
+    binding: &[u8; 32],
+) -> bool {
+    *binding == consent_binding(&session.exporter, &session.device_id, offer)
+        && offer.peer == session.fingerprint
+}
+
+/// Non-serializable, non-clonable result of the in-process Qt owner modal.
+/// A caller cannot approve anything by supplying a boolean or raw response.
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+pub struct LinuxQtConsentGrant {
+    ticket: ConsentTicket,
+    destination: crate::receiver::LocalDestinationLease,
+    selected_directory: PathBuf,
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+impl LinuxQtConsentGrant {
+    pub fn selected_directory(&self) -> &Path {
+        &self.selected_directory
+    }
+    pub fn into_parts(self) -> (ConsentTicket, crate::receiver::LocalDestinationLease) {
+        (self.ticket, self.destination)
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+const LINUX_QT_CONSENT_TTL: Duration = Duration::from_secs(120);
+
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+fn boot_time_nanos() -> i128 {
+    // CLOCK_BOOTTIME also advances through suspend, unlike CLOCK_MONOTONIC.
+    let ts = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+    (ts.tv_sec as i128) * 1_000_000_000 + (ts.tv_nsec as i128)
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+fn within_qt_owner_deadline(start: i128, end: i128, active: bool) -> bool {
+    active && end >= start && end - start < (LINUX_QT_CONSENT_TTL.as_nanos() as i128)
+}
+
+// Bounded replay ledger for the lifetime of the TLS-owning process. A fresh
+// process cannot recreate an old exporter without the original TLS session.
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+static QT_CONSUMED: OnceLock<Mutex<HashSet<[u8; 32]>>> = OnceLock::new();
+
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+fn consume_qt_binding(binding: [u8; 32]) -> Result<(), Error> {
+    let mut consumed = QT_CONSUMED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map_err(|_| Error::Unauthorized)?;
+    if consumed.contains(&binding) || consumed.len() >= 4096 {
+        return Err(Error::Unauthorized);
+    }
+    consumed.insert(binding);
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+fn qt_arg(text: &str) -> Result<CString, Error> {
+    CString::new(text).map_err(|_| Error::Invalid("Qt display metadata"))
+}
+
+// Native code presents the modal but never sees TLS exporter secrets or
+// constructs a ConsentTicket; no network/IPC entrypoint is registered.
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+extern "C" {
+    fn opendrop_qt_present_owner_consent(
+        device: *const c_char,
+        fingerprint: *const c_char,
+        id: *const c_char,
+        name: *const c_char,
+        hash: *const c_char,
+        bytes: u64,
+        initial_dir: *const c_char,
+        selected_out: *mut c_char,
+        capacity: usize,
+    ) -> i32;
+}
+
+/// Modal consent on QApplication's GUI thread only. Qt checks active logind
+/// user/seat before and after the action; only its owned Accept-button handler
+/// returns approval. This is not cryptographic physical-presence proof.
+/// Rust enforces a monotonic 120s deadline, transport cancellation and
+/// single-use session+offer binding. The TLS owner MUST mark its cancellation
+/// flag when the socket closes; no native listener exists yet.
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+pub fn request_linux_qt_owner_consent(
+    prompt: ConsentPrompt,
+    initial_destination: &Path,
+    transport_active: &AtomicBool,
+) -> Result<LinuxQtConsentGrant, Error> {
+    if !transport_active.load(Ordering::Acquire) {
+        return Err(Error::Unauthorized);
+    }
+    let started = boot_time_nanos();
+    let initial = initial_destination
+        .to_str()
+        .ok_or(Error::Invalid("owner-selected directory encoding"))?;
+    if !initial_destination.is_absolute()
+        || initial.len() > 4096
+        || initial.chars().any(char::is_control)
+    {
+        return Err(Error::Invalid("initial owner destination"));
+    }
+    let device = qt_arg(prompt.device.as_str())?;
+    let peer = qt_arg(prompt.offer.peer.as_str())?;
+    let transfer = qt_arg(prompt.offer.id.as_str())?;
+    let file_name = qt_arg(&prompt.offer.name)?;
+    let checksum = qt_arg(prompt.offer.sha256.as_str())?;
+    let initial_dir = qt_arg(initial)?;
+    let mut selected = [0i8; 4097];
+    // SAFETY: inputs live through this synchronous call; output is a writable
+    // bounded buffer. The C++ ABI returns a status and a NUL-terminated path.
+    let decision = unsafe {
+        opendrop_qt_present_owner_consent(
+            device.as_ptr(),
+            peer.as_ptr(),
+            transfer.as_ptr(),
+            file_name.as_ptr(),
+            checksum.as_ptr(),
+            prompt.offer.bytes,
+            initial_dir.as_ptr(),
+            selected.as_mut_ptr(),
+            selected.len(),
+        )
+    };
+    if decision != 1
+        || !within_qt_owner_deadline(
+            started,
+            boot_time_nanos(),
+            transport_active.load(Ordering::Acquire),
+        )
+    {
+        return Err(Error::Unauthorized);
+    }
+    let end = selected
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(Error::Unauthorized)?;
+    let path_bytes: Vec<u8> = selected[..end].iter().map(|byte| *byte as u8).collect();
+    let selected_path = PathBuf::from(
+        std::str::from_utf8(&path_bytes).map_err(|_| Error::Invalid("Qt path encoding"))?,
+    );
+    if !selected_path.is_absolute()
+        || end == 0
+        || selected_path
+            .components()
+            .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+        || path_bytes.iter().any(u8::is_ascii_control)
+    {
+        return Err(Error::Invalid("Qt selected a noncanonical destination"));
+    }
+    let binding = consent_binding(&prompt.session, &prompt.device, &prompt.offer);
+    consume_qt_binding(binding)?;
+    let destination = crate::receiver::LocalDestinationLease::from_local_qt_owner_action(
+        &prompt.offer,
+        selected_path.clone(),
+        binding,
+    )?;
+    let ticket = ConsentTicket {
+        offer: prompt.offer,
+        session: prompt.session,
+        device: prompt.device,
+    };
+    Ok(LinuxQtConsentGrant {
+        ticket,
+        destination,
+        selected_directory: selected_path,
+    })
+}
+
+#[cfg(all(test, target_os = "linux", feature = "linux-qt-consent"))]
+mod linux_qt_authority_tests {
+    use super::*;
+    use crate::identity::{KeyFingerprint, Sha256Digest, TransferId};
+
+    fn offer(id: &str) -> FileOffer {
+        FileOffer {
+            id: TransferId::parse(id).unwrap(),
+            peer: KeyFingerprint::parse(&"b".repeat(64)).unwrap(),
+            manifest: Sha256Digest::parse(&"c".repeat(64)).unwrap(),
+            name: "file.txt".to_owned(),
+            bytes: 4,
+            sha256: Sha256Digest::parse(&"d".repeat(64)).unwrap(),
+        }
+    }
+
+    #[test]
+    fn privileged_deadline_includes_suspend_and_rejects_cancelled_or_expired() {
+        let t = 100_000_000_000i128;
+        let ttl = LINUX_QT_CONSENT_TTL.as_nanos() as i128;
+        assert!(within_qt_owner_deadline(t, t + ttl - 1, true));
+        assert!(!within_qt_owner_deadline(t, t + ttl, true));
+        assert!(!within_qt_owner_deadline(t, t + 5, false));
+        assert!(!within_qt_owner_deadline(t, t - 1, true));
+    }
+
+    #[test]
+    fn one_use_consent_binding_differs_by_tls_session_and_exact_offer() {
+        let claimed = DeviceId::parse(&"1".repeat(32)).unwrap();
+        let mut first_exporter = [7u8; 32];
+        let first = consent_binding(&first_exporter, &claimed, &offer(&"a".repeat(32)));
+        assert!(consume_qt_binding(first).is_ok());
+        assert!(consume_qt_binding(first).is_err());
+        first_exporter[0] = 8;
+        let other_session = consent_binding(&first_exporter, &claimed, &offer(&"a".repeat(32)));
+        let other_offer = consent_binding(&[7u8; 32], &claimed, &offer(&"e".repeat(32)));
+        assert_ne!(first, other_session);
+        assert_ne!(first, other_offer);
+        let session = AuthenticatedSession {
+            device_id: claimed,
+            fingerprint: offer(&"a".repeat(32)).peer,
+            exporter: [7u8; 32],
+        };
+        let accepted = offer(&"a".repeat(32));
+        assert!(matches_native_lease(&session, &accepted, &first));
+        assert!(!matches_native_lease(&session, &accepted, &other_session));
+        assert!(!matches_native_lease(
+            &session,
+            &offer(&"e".repeat(32)),
+            &first
+        ));
+    }
+
+    #[test]
+    fn no_local_desktop_cannot_return_a_usable_approval() {
+        // This is a fail-closed check only. We never create QApplication,
+        // logind session, synthetic UI click, or a fake approved response.
+        let claimed = DeviceId::parse(&"1".repeat(32)).unwrap();
+        let prompt = ConsentPrompt {
+            offer: offer(&"f".repeat(32)),
+            session: [3u8; 32],
+            device: claimed,
+        };
+        let disconnected = AtomicBool::new(false);
+        assert!(matches!(
+            request_linux_qt_owner_consent(prompt, Path::new("/tmp"), &disconnected),
+            Err(Error::Unauthorized)
+        ));
+    }
 }
 
 fn check_at(

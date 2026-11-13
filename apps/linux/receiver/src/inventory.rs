@@ -6,7 +6,7 @@
 
 use crate::storage::{inspect_owned_published, StageIdentity};
 use opendrop_core::identity::{KeyFingerprint, Sha256Digest, TransferId};
-use opendrop_core::journal::{FileOffer, Journal, Phase};
+use opendrop_core::journal::{FileOffer, LinuxLocalRecovery, Phase};
 use opendrop_core::wire::MAX_FILE;
 use opendrop_core::Error;
 use rustix::fs::{fsync, openat, unlinkat, AtFlags, Mode, OFlags, RawDir};
@@ -214,7 +214,7 @@ fn remove_owned_private_stage(dir: &File, record: &PersistedStage) -> Result<(),
 pub(crate) fn reconcile(
     stage: &File,
     destination: &File,
-    journal: &Journal,
+    recovery: &LinuxLocalRecovery<'_>,
 ) -> Result<RestartReport, Error> {
     let enumeration_fd = openat(
         stage,
@@ -251,7 +251,7 @@ pub(crate) fn reconcile(
     for meta in manifest_names {
         let record = decode(stage, &meta)?;
         parts.remove(&record.identity.name);
-        match journal.linux_local_recovery_phase(&record.offer)? {
+        match recovery.phase_for_exact_offer(&record.offer)? {
             None => {
                 // Missing journal evidence is NOT proof the stage was never
                 // published. Preserve it for owner-supervised recovery.

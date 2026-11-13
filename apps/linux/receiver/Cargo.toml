@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-opendrop-core = { path = "../../../crates/opendrop-core" }
+opendrop-core = { path = "../../../crates/opendrop-core", features = ["linux-qt-consent"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "=1.1.4", features = ["fs", "process"] }
