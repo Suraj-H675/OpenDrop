@@ -287,6 +287,16 @@ impl Journal {
         }))
     }
 
+    /// Read-only, exact-offer lookup for the Linux owner's offline startup
+    /// staging reconciliation. Deliberately exposes ONLY a journal phase,
+    /// not a destination path, receipt, trust mutation or recovery write.
+    /// The owning receiver must call this before opening any network listener
+    /// and must not forward it to peers or ordinary public IPC methods.
+    #[cfg(target_os = "linux")]
+    pub fn linux_local_recovery_phase(&self, offer: &FileOffer) -> Result<Option<Phase>, Error> {
+        Ok(self.require_offer(offer)?.map(|(phase, _)| phase))
+    }
+
     /// INTERNAL commit-intent; public writes require AuthorizedOffer.
     /// Commit-intent is fsynced via SQLite FULL before native publication.
     /// Same ID cannot switch targets after restart or a lost ACK.
@@ -647,6 +657,37 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .revoked
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_only_native_stage_recovery_has_exact_offer_and_phase_checks() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&folder.path().join("recovery.sqlite")).unwrap();
+        let offer = FileOffer {
+            id: TransferId::parse(&"1".repeat(32)).unwrap(),
+            peer: KeyFingerprint::parse(&"2".repeat(64)).unwrap(),
+            manifest: Sha256Digest::parse(&"3".repeat(64)).unwrap(),
+            name: "recovery.txt".into(),
+            bytes: 1,
+            sha256: Sha256Digest::parse(&"4".repeat(64)).unwrap(),
+        };
+        assert_eq!(journal.linux_local_recovery_phase(&offer).unwrap(), None);
+        journal.reserve(&offer).unwrap();
+        assert_eq!(
+            journal.linux_local_recovery_phase(&offer).unwrap(),
+            Some(Phase::Reserved)
+        );
+        let mut wrong = offer.clone();
+        wrong.sha256 = Sha256Digest::parse(&"5".repeat(64)).unwrap();
+        assert!(journal.linux_local_recovery_phase(&wrong).is_err());
+        journal
+            .record_commit_intent(&offer, "recovery.txt")
+            .unwrap();
+        assert_eq!(
+            journal.linux_local_recovery_phase(&offer).unwrap(),
+            Some(Phase::CommitIntent)
         );
     }
 

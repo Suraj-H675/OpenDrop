@@ -51,10 +51,19 @@ impl ReceiveState {
 /// A local destination capability. Its private constructor MUST be supplied
 /// later by a reviewed native adapter after genuine owner selection; not by a
 /// network handler, deserializer, CLI-supplied peer path or remote caller.
-/// No constructor exists in production S1-A, so publishing is fail-closed.
+/// No production constructor is currently available; publishing fails closed.
+///
+/// ```compile_fail
+/// use opendrop_core::receiver::LocalDestinationLease;
+/// let _ = LocalDestinationLease::after_linux_owner_confirmation("file.txt");
+/// ```
 pub struct LocalDestinationLease {
     reference: String,
 }
+
+// There is deliberately NO production constructor for this privileged
+// destination lease. The reviewed owner-controlled native UI boundary must
+// also bind the user's chosen destination before enabling publication.
 
 /// Owned local staging capability. A native adapter must implement these
 /// operations on an owner-private temporary file, never on a path received

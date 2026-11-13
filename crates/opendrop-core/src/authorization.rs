@@ -2,8 +2,9 @@
 //!
 //! Trust comes from the authenticated rustls TLS 1.3 peer certificate, not
 //! multicast claims, caller-supplied fingerprints, or UI-supplied booleans.
-//! The actual native UI must exclusively own `LocalConsentBroker`; never
-//! expose its `approve_from_local_user_action` method over any network IPC.
+//! LocalConsentBroker is strictly test-only. The real native GUI approval
+//! issuer does not yet exist and must remain private to this security module;
+//! neither a terminal nor network/public IPC is an acceptable fallback.
 
 use crate::identity::{DeviceId, KeyFingerprint};
 use crate::journal::{DurablePublisher, FileOffer, Journal, Receipt, Snapshot};
@@ -95,6 +96,14 @@ impl ConsentPrompt {
     }
 }
 
+/// Production Linux consent has no public issuer. The reviewed in-process Qt
+/// bridge must privately bind the exact session/offer/destination. A terminal,
+/// ordinary IPC, bool or raw token is not an acceptable approval source.
+///
+/// A public terminal issuer must remain unresolvable:
+/// ```compile_fail
+/// use opendrop_core::authorization::confirm_linux_foreground_owner;
+/// ```
 pub struct ConsentTicket {
     offer: FileOffer,
     session: [u8; 32],

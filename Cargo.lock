@@ -218,6 +218,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "opendrop-linux-receiver"
+version = "0.1.0"
+dependencies = [
+ "opendrop-core",
+ "rustix",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"

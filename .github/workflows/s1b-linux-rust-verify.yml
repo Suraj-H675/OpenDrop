@@ -1,0 +1,48 @@
+name: S1-B Linux receiver Rust verification
+
+on:
+  push:
+    branches:
+      - verification/s1b-linux-20261113
+
+permissions:
+  contents: read
+
+jobs:
+  verify-s1b-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact pushed revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2; reviewed and used by S1-A
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Require S1-B branch and exact commit
+        shell: bash
+        run: |
+          test "$GITHUB_EVENT_NAME" = 'push'
+          test "$GITHUB_REF" = 'refs/heads/verification/s1b-linux-20261113'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          printf 'Verified GITHUB_SHA=%s\n' "$GITHUB_SHA"
+
+      - name: Set up runner-local Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Record hosted runner and Rust versions
+        shell: bash
+        run: |
+          cat /etc/os-release
+          rustc --version --verbose
+          cargo --version
+          rustfmt --version
+
+      - name: Verify Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Compile and test shared core and Linux receiver
+        run: cargo test -p opendrop-core -p opendrop-linux-receiver --locked
