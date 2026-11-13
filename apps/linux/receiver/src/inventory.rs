@@ -132,7 +132,7 @@ fn encode(record: &PersistedStage) -> Result<Vec<u8>, Error> {
         .ok_or(Error::Invalid("stage without approved destination"))?;
     let path = valid_owner_path(&destination.path)?;
     let value = format!(
-        "{VERSION}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        "{VERSION}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
         identity.name,
         identity.dev,
         identity.ino,

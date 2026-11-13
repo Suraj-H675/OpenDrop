@@ -31,7 +31,7 @@ fn read_private_der(parent: &File, name: &str, max: u64) -> Result<Vec<u8>, Erro
         Mode::empty(),
     )
     .map_err(|error| Error::Io(error.into()))?;
-    let mut file = File::from(handle);
+    let file = File::from(handle);
     let metadata = file.metadata()?;
     if !metadata.is_file()
         || metadata.uid() != rustix::process::geteuid().as_raw()
