@@ -14,6 +14,7 @@
 
 mod inventory;
 pub mod storage;
+pub mod tls;
 
 pub use inventory::RestartReport;
 

@@ -223,7 +223,9 @@ name = "opendrop-linux-receiver"
 version = "0.1.0"
 dependencies = [
  "opendrop-core",
+ "rusqlite",
  "rustix",
+ "rustls",
  "sha2",
  "tempfile",
 ]

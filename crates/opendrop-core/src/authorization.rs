@@ -67,6 +67,33 @@ impl AuthenticatedSession {
         &self.fingerprint
     }
 
+    /// Production Linux foreground listener: accepts ONLY a completed,
+    /// strictly client-certificate-verified TLS 1.3 session whose actual
+    /// certificate fingerprint already maps to one locally paired identity.
+    /// A caller-supplied DeviceId or an unpaired/guest certificate cannot
+    /// manufacture that identity. No pairing enrollment exists yet.
+    pub fn from_paired_tls_server(
+        tls: &ServerConnection,
+        journal: &Journal,
+    ) -> Result<Self, Error> {
+        if tls.is_handshaking() || tls.protocol_version() != Some(ProtocolVersion::TLSv1_3) {
+            return Err(Error::Unauthorized);
+        }
+        let leaf = tls
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .ok_or(Error::Unauthorized)?;
+        let actual = KeyFingerprint::parse(&format!("{:x}", Sha256::digest(leaf.as_ref())))?;
+        let known_device = journal
+            .paired_identity_for_cert(&actual)?
+            .ok_or(Error::PeerUntrusted)?;
+        let session = Self::from_verified_tls_server(tls, known_device)?;
+        if session.fingerprint != actual {
+            return Err(Error::Unauthorized);
+        }
+        Ok(session)
+    }
+
     /// The only peer-facing lost-ACK receipt query. The caller must already
     /// own a completed, certificate-authenticated TLS session; knowing a
     /// transfer ID or guessed hash alone is insufficient. No destination
@@ -405,6 +432,17 @@ unsafe extern "C" fn qt_pin_owner_directory(
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+unsafe extern "C" fn qt_transport_still_active(context: *const c_void) -> i32 {
+    if context.is_null() {
+        return 0;
+    }
+    // SAFETY: points to the caller's live AtomicBool for the entire
+    // synchronous Qt modal; only atomic loads occur on this pointer.
+    let live = unsafe { &*(context as *const AtomicBool) };
+    i32::from(live.load(Ordering::Acquire))
+}
+
 // Native code presents the modal but never sees TLS exporter secrets or
 // constructs a ConsentTicket; no network/IPC entrypoint is registered.
 #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
@@ -419,6 +457,8 @@ extern "C" {
         initial_dir: *const c_char,
         pin: unsafe extern "C" fn(*mut c_void, *const c_char, usize) -> i32,
         pin_context: *mut c_void,
+        is_active: unsafe extern "C" fn(*const c_void) -> i32,
+        active_context: *const c_void,
         selected_out: *mut c_char,
         capacity: usize,
     ) -> i32;
@@ -470,6 +510,8 @@ pub fn request_linux_qt_owner_consent(
             initial_dir.as_ptr(),
             qt_pin_owner_directory,
             (&mut pinned as *mut QtPinnedDestination).cast::<c_void>(),
+            qt_transport_still_active,
+            (transport_active as *const AtomicBool).cast::<c_void>(),
             selected.as_mut_ptr(),
             selected.len(),
         )

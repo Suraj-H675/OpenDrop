@@ -180,9 +180,21 @@ pub struct LinuxLocalRecovery<'a> {
     protected_stage: &'a File,
 }
 
+/// Read-only local journal fact, never a network receipt or write authority.
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxRecoveryTransaction {
+    pub phase: Phase,
+    /// Only the accepted safe filename, not the native directory path.
+    pub destination_ref: Option<String>,
+}
+
 #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
 impl LinuxLocalRecovery<'_> {
-    pub fn phase_for_exact_offer(&self, offer: &FileOffer) -> Result<Option<Phase>, Error> {
+    pub fn transaction_for_exact_offer(
+        &self,
+        offer: &FileOffer,
+    ) -> Result<Option<LinuxRecoveryTransaction>, Error> {
         let info = self.protected_stage.metadata()?;
         if !info.is_dir()
             || info.uid() != rustix::process::geteuid().as_raw()
@@ -190,7 +202,13 @@ impl LinuxLocalRecovery<'_> {
         {
             return Err(Error::Unauthorized);
         }
-        Ok(self.journal.require_offer(offer)?.map(|(phase, _)| phase))
+        Ok(self
+            .journal
+            .require_offer(offer)?
+            .map(|(phase, destination_ref)| LinuxRecoveryTransaction {
+                phase,
+                destination_ref,
+            }))
     }
 }
 
@@ -493,6 +511,28 @@ impl Journal {
         })
         .transpose()
     }
+    /// Only the authenticated TLS listener uses this to map a verified leaf
+    /// certificate to an already paired, nonrevoked local identity. The wire
+    /// peer cannot supply a claimed DeviceId and thereby select another row.
+    /// No production trust-enrollment shortcut is introduced.
+    pub(crate) fn paired_identity_for_cert(
+        &self,
+        fingerprint: &KeyFingerprint,
+    ) -> Result<Option<DeviceId>, Error> {
+        let mut statement = self.db.prepare(
+            "SELECT device_id FROM trusted_devices
+             WHERE fingerprint=?1 AND revoked=0 LIMIT 2",
+        )?;
+        let mut rows = statement.query([fingerprint.as_str()])?;
+        let first = match rows.next()? {
+            Some(row) => DeviceId::parse(&row.get::<_, String>(0)?)?,
+            None => return Ok(None),
+        };
+        if rows.next()?.is_some() {
+            return Err(Error::PeerUntrusted);
+        }
+        Ok(Some(first))
+    }
     /// A previously revoked certificate is blocked even when an attacker
     /// supplies a different DeviceId under temporary Everyone visibility.
     pub(crate) fn peer_revoked_or_key_changed(
@@ -697,6 +737,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn existing_paired_certificate_lookup_is_local_exact_and_revocable() {
+        let owned = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&owned.path().join("cert-mapping.sqlite")).unwrap();
+        let device = id();
+        let actual = key('a');
+        let unrelated = key('b');
+        assert!(journal.paired_identity_for_cert(&actual).unwrap().is_none());
+        journal
+            .record_cryptographically_verified_peer(&device, &actual)
+            .unwrap();
+        assert_eq!(
+            journal.paired_identity_for_cert(&actual).unwrap(),
+            Some(device.clone())
+        );
+        assert!(journal
+            .paired_identity_for_cert(&unrelated)
+            .unwrap()
+            .is_none());
+        journal.revoke_device(&device).unwrap();
+        assert!(journal.paired_identity_for_cert(&actual).unwrap().is_none());
+    }
+
     #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
     #[test]
     fn read_only_native_stage_recovery_has_exact_offer_and_phase_checks() {
@@ -722,7 +785,7 @@ mod tests {
             journal
                 .local_linux_recovery(&stage_fd)
                 .unwrap()
-                .phase_for_exact_offer(&offer)
+                .transaction_for_exact_offer(&offer)
                 .unwrap(),
             None
         );
@@ -731,16 +794,19 @@ mod tests {
             journal
                 .local_linux_recovery(&stage_fd)
                 .unwrap()
-                .phase_for_exact_offer(&offer)
+                .transaction_for_exact_offer(&offer)
                 .unwrap(),
-            Some(Phase::Reserved)
+            Some(LinuxRecoveryTransaction {
+                phase: Phase::Reserved,
+                destination_ref: None,
+            })
         );
         let mut wrong = offer.clone();
         wrong.sha256 = Sha256Digest::parse(&"5".repeat(64)).unwrap();
         assert!(journal
             .local_linux_recovery(&stage_fd)
             .unwrap()
-            .phase_for_exact_offer(&wrong)
+            .transaction_for_exact_offer(&wrong)
             .is_err());
         journal
             .record_commit_intent(&offer, "recovery.txt")
@@ -749,9 +815,12 @@ mod tests {
             journal
                 .local_linux_recovery(&stage_fd)
                 .unwrap()
-                .phase_for_exact_offer(&offer)
+                .transaction_for_exact_offer(&offer)
                 .unwrap(),
-            Some(Phase::CommitIntent)
+            Some(LinuxRecoveryTransaction {
+                phase: Phase::CommitIntent,
+                destination_ref: Some("recovery.txt".into()),
+            })
         );
         std::fs::set_permissions(private_stage.path(), std::fs::Permissions::from_mode(0o755))
             .unwrap();

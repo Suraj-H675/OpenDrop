@@ -49,7 +49,7 @@ fn verified_dir(file: &File, private: bool) -> Result<(), Error> {
 /// Open an owner-specified *absolute* directory without following symlinks
 /// in ANY component. The starting "/" handle is trusted and openat2 refuses
 /// traversal outside it. Kernel without openat2 support fails closed.
-fn open_owner_directory(path: &Path, private: bool) -> Result<File, Error> {
+pub(crate) fn open_owner_directory(path: &Path, private: bool) -> Result<File, Error> {
     if !path.is_absolute()
         || path
             .components()
@@ -216,7 +216,13 @@ impl LinuxReceiverStorage {
         // private, non-publishable orphan; startup inventory treats unknown
         // entries conservatively (never unlinks unrelated entries).
         file.sync_all()?;
-        inventory::persist(&self.directories.stage, &identity, offer)?;
+        inventory::persist(
+            &self.directories.stage,
+            &identity,
+            offer,
+            &self.destination_label,
+            &self.directories.destination,
+        )?;
         let stage = LinuxOwnedStage {
             dir: self.directories.clone(),
             file,
@@ -239,11 +245,7 @@ impl LinuxReceiverStorage {
     /// the existing AuthorizedOffer::reconcile_intent transaction API.
     pub fn recover_before_listen(&self, journal: &Journal) -> Result<RestartReport, Error> {
         let recovery = journal.local_linux_recovery(&self.directories.stage)?;
-        inventory::reconcile(
-            &self.directories.stage,
-            &self.directories.destination,
-            &recovery,
-        )
+        inventory::reconcile(&self.directories.stage, &recovery)
     }
 }
 
@@ -435,6 +437,33 @@ mod tests {
     use super::*;
     use opendrop_core::identity::{KeyFingerprint, TransferId};
     use std::os::unix::fs::PermissionsExt;
+
+    /// Synthetic journal phase fixture, NOT a production journal mutation
+    /// route. The real transfer can only transition through AuthorizedOffer.
+    fn fixture_journal_phase(path: &Path, offer: &FileOffer, phase: &str) {
+        assert!(matches!(phase, "reserved" | "intent" | "committed"));
+        let database = rusqlite::Connection::open(path).unwrap();
+        database
+            .execute(
+                "INSERT INTO transfers(id,peer,manifest,name,bytes,sha,phase,destination_ref)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                rusqlite::params![
+                    offer.id.as_str(),
+                    offer.peer.as_str(),
+                    offer.manifest.as_str(),
+                    offer.name,
+                    offer.bytes as i64,
+                    offer.sha256.as_str(),
+                    phase,
+                    if phase == "reserved" {
+                        None
+                    } else {
+                        Some(offer.name.as_str())
+                    },
+                ],
+            )
+            .unwrap();
+    }
 
     /// Filesystem fixtures must match the production private-root contract.
     /// `tempfile::tempdir()` requests 0777 (umask-dependent), not 0700.
@@ -653,5 +682,191 @@ mod tests {
         assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
         // An unknown journal state never manufactures cleanup authority.
         assert_eq!(storage.recover_before_listen(&journal).unwrap(), result);
+    }
+
+    #[test]
+    fn restart_intent_inspects_only_the_transfer_specific_owner_destination() {
+        let private = private_stage_root();
+        let configured = tempfile::tempdir().unwrap();
+        let approved = tempfile::tempdir().unwrap();
+        let journal_path = private.path().join("journal.sqlite");
+        let journal = Journal::open(&journal_path).unwrap();
+        let offered = offer(b"approved bytes", "approved-only.bin");
+        let stage_name;
+        {
+            let original =
+                LinuxReceiverStorage::open_private(private.path(), configured.path()).unwrap();
+            let pinned = open_owner_directory(approved.path(), false).unwrap();
+            let selected = original
+                .with_pinned_owner_destination(approved.path(), &pinned)
+                .unwrap();
+            let (mut stage, publisher) = selected.allocate(&offered).unwrap();
+            stage.append_chunk(b"approved bytes").unwrap();
+            stage.sync_staged().unwrap();
+            stage_name = stage.identity.name.clone();
+            fixture_journal_phase(&journal_path, &offered, "intent");
+            // Simulate interruption after no-replace publication but before
+            // durable journal Committed. Not a real power-loss simulation.
+            std::fs::rename(
+                private.path().join("staging").join(&stage_name),
+                approved.path().join(&offered.name),
+            )
+            .unwrap();
+            // A decoy with identical bytes in configured default directory
+            // must never be interpreted as the approved publication.
+            std::fs::write(configured.path().join(&offered.name), b"approved bytes").unwrap();
+            drop(publisher);
+            drop(stage);
+        }
+        let restarted =
+            LinuxReceiverStorage::open_private(private.path(), configured.path()).unwrap();
+        let result = restarted.recover_before_listen(&journal).unwrap();
+        assert_eq!(result.preserved_unresolved_intent, 1);
+        assert_eq!(result.intent_published_awaiting_authenticated_reconcile, 1);
+        assert!(private
+            .path()
+            .join("staging")
+            .join(format!("{stage_name}.meta"))
+            .exists());
+        assert_eq!(
+            std::fs::read(approved.path().join(&offered.name)).unwrap(),
+            b"approved bytes"
+        );
+        assert_eq!(
+            std::fs::read(configured.path().join(&offered.name)).unwrap(),
+            b"approved bytes"
+        );
+    }
+
+    #[test]
+    fn replaced_or_moved_destination_never_redirects_restart_inspection() {
+        let private = private_stage_root();
+        let fallback = tempfile::tempdir().unwrap();
+        let chosen_parent = tempfile::tempdir().unwrap();
+        let chosen = chosen_parent.path().join("chosen");
+        let renamed = chosen_parent.path().join("moved-owner-folder");
+        std::fs::create_dir(&chosen).unwrap();
+        let journal_path = private.path().join("journal.sqlite");
+        let journal = Journal::open(&journal_path).unwrap();
+        let offered = offer(b"private stage evidence", "rename.bin");
+        {
+            let source =
+                LinuxReceiverStorage::open_private(private.path(), fallback.path()).unwrap();
+            let original = open_owner_directory(&chosen, false).unwrap();
+            let approved = source
+                .with_pinned_owner_destination(&chosen, &original)
+                .unwrap();
+            let (mut stage, publisher) = approved.allocate(&offered).unwrap();
+            stage.append_chunk(b"private stage evidence").unwrap();
+            stage.sync_staged().unwrap();
+            fixture_journal_phase(&journal_path, &offered, "intent");
+            drop(publisher);
+            drop(stage);
+        }
+        std::fs::rename(&chosen, &renamed).unwrap();
+        // The new folder contains an identical filename, deliberately.
+        std::fs::create_dir(&chosen).unwrap();
+        std::fs::write(chosen.join(&offered.name), b"private stage evidence").unwrap();
+        let store = LinuxReceiverStorage::open_private(private.path(), fallback.path()).unwrap();
+        let report = store.recover_before_listen(&journal).unwrap();
+        assert_eq!(report.preserved_unverifiable_destination, 1);
+        assert_eq!(report.intent_published_awaiting_authenticated_reconcile, 0);
+        assert_eq!(report.removed_precommit + report.removed_committed, 0);
+        assert_eq!(
+            std::fs::read(chosen.join(&offered.name)).unwrap(),
+            b"private stage evidence"
+        );
+        std::fs::remove_file(chosen.join(&offered.name)).unwrap();
+        std::fs::remove_dir(&chosen).unwrap();
+        assert_eq!(
+            store
+                .recover_before_listen(&journal)
+                .unwrap()
+                .preserved_unverifiable_destination,
+            1
+        );
+    }
+
+    #[test]
+    fn reserved_stage_cleans_only_when_approved_directory_can_be_authenticated() {
+        let private = private_stage_root();
+        let destination = tempfile::tempdir().unwrap();
+        let journal_path = private.path().join("journal.sqlite");
+        let journal = Journal::open(&journal_path).unwrap();
+        let offered = offer(b"uncommitted", "only-stage.txt");
+        let stage_name;
+        {
+            let store =
+                LinuxReceiverStorage::open_private(private.path(), destination.path()).unwrap();
+            let (mut stage, _publisher) = store.allocate(&offered).unwrap();
+            stage.append_chunk(b"uncommitted").unwrap();
+            stage.sync_staged().unwrap();
+            stage_name = stage.identity.name.clone();
+            fixture_journal_phase(&journal_path, &offered, "reserved");
+        }
+        let restarted =
+            LinuxReceiverStorage::open_private(private.path(), destination.path()).unwrap();
+        assert_eq!(
+            restarted
+                .recover_before_listen(&journal)
+                .unwrap()
+                .removed_precommit,
+            1
+        );
+        assert!(!private.path().join("staging").join(&stage_name).exists());
+        assert!(!private
+            .path()
+            .join("staging")
+            .join(format!("{stage_name}.meta"))
+            .exists());
+    }
+
+    #[test]
+    fn committed_restart_cleans_only_owned_stage_after_exact_destination_verification() {
+        let private = private_stage_root();
+        let fallback = tempfile::tempdir().unwrap();
+        let approved = tempfile::tempdir().unwrap();
+        let journal_path = private.path().join("journal.sqlite");
+        let journal = Journal::open(&journal_path).unwrap();
+        let offered = offer(b"durably committed", "done.bin");
+        let stage_name;
+        {
+            let source =
+                LinuxReceiverStorage::open_private(private.path(), fallback.path()).unwrap();
+            let original = open_owner_directory(approved.path(), false).unwrap();
+            let target = source
+                .with_pinned_owner_destination(approved.path(), &original)
+                .unwrap();
+            let (mut stage, publisher) = target.allocate(&offered).unwrap();
+            stage_name = stage.identity.name.clone();
+            stage.append_chunk(b"durably committed").unwrap();
+            stage.sync_staged().unwrap();
+            fixture_journal_phase(&journal_path, &offered, "committed");
+            std::fs::rename(
+                private.path().join("staging").join(&stage_name),
+                approved.path().join(&offered.name),
+            )
+            .unwrap();
+            drop(stage);
+            drop(publisher);
+        }
+        let restarted =
+            LinuxReceiverStorage::open_private(private.path(), fallback.path()).unwrap();
+        let report = restarted.recover_before_listen(&journal).unwrap();
+        assert_eq!(report.removed_committed, 1);
+        assert_eq!(report.preserved_unresolved_intent, 0);
+        assert_eq!(
+            std::fs::read(approved.path().join(&offered.name)).unwrap(),
+            b"durably committed"
+        );
+        assert!(!private
+            .path()
+            .join("staging")
+            .join(format!("{stage_name}.meta"))
+            .exists());
+        assert_eq!(
+            restarted.recover_before_listen(&journal).unwrap(),
+            RestartReport::default()
+        );
     }
 }

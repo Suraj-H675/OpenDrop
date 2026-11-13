@@ -4,7 +4,13 @@
 #include <QCoreApplication>
 #include <QGuiApplication>
 #include <QThread>
+#include <QTimer>
 #include <QByteArray>
+#include <QEventLoop>
+#include <QPushButton>
+#include <QLabel>
+#include <QVBoxLayout>
+#include <QWidget>
 
 #include <systemd/sd-login.h>
 #include <sys/types.h>
@@ -14,8 +20,99 @@
 #include <cstddef>
 #include <cstring>
 #include <optional>
+#include <atomic>
+#include <csignal>
+#include <memory>
 #include <string>
 #include <utility>
+
+namespace {
+
+std::unique_ptr<QApplication> foregroundApp;
+std::unique_ptr<QWidget> foregroundWindow;
+QLabel *foregroundStatus = nullptr;
+std::atomic<bool> foregroundStop{false};
+volatile std::sig_atomic_t caughtShutdownSignal = 0;
+
+void foreground_signal(int) {
+    caughtShutdownSignal = 1;
+}
+
+} // namespace
+
+// A visible owner-controlled foreground window remains alive outside modal
+// approvals. It registers no D-Bus endpoint or remote click capability.
+extern "C" int opendrop_qt_foreground_start() noexcept {
+    try {
+        if (QCoreApplication::instance()) {
+            return -1;
+        }
+        static int argc = 1;
+        static char name[] = "opendrop-linux-receiver";
+        static char *argv[] = {name, nullptr};
+        foregroundApp = std::make_unique<QApplication>(argc, argv);
+        foregroundApp->setQuitOnLastWindowClosed(false);
+        foregroundStop.store(false, std::memory_order_release);
+        caughtShutdownSignal = 0;
+        std::signal(SIGINT, foreground_signal);
+        std::signal(SIGTERM, foreground_signal);
+        foregroundWindow = std::make_unique<QWidget>();
+        foregroundWindow->setWindowTitle(QStringLiteral("OpenDrop — Receiving"));
+        foregroundWindow->setMinimumWidth(430);
+        auto *layout = new QVBoxLayout(foregroundWindow.get());
+        foregroundStatus = new QLabel(
+            QStringLiteral("Waiting for a previously paired device."), foregroundWindow.get());
+        foregroundStatus->setTextFormat(Qt::PlainText);
+        foregroundStatus->setWordWrap(true);
+        layout->addWidget(foregroundStatus);
+        auto *stop = new QPushButton(QStringLiteral("Stop receiving"), foregroundWindow.get());
+        layout->addWidget(stop);
+        QObject::connect(stop, &QPushButton::clicked, foregroundWindow.get(), []() {
+            foregroundStop.store(true, std::memory_order_release);
+        });
+        QObject::connect(foregroundApp.get(), &QGuiApplication::lastWindowClosed,
+                         []() { foregroundStop.store(true, std::memory_order_release); });
+        foregroundWindow->show();
+        return 1;
+    } catch (...) {
+        foregroundStop.store(true, std::memory_order_release);
+        return -1;
+    }
+}
+
+extern "C" int opendrop_qt_foreground_stop_requested() noexcept {
+    return (caughtShutdownSignal != 0 || foregroundStop.load(std::memory_order_acquire)) ? 1 : 0;
+}
+
+extern "C" void opendrop_qt_foreground_poll() noexcept {
+    try {
+        if (foregroundApp) {
+            if (caughtShutdownSignal != 0) {
+                foregroundStop.store(true, std::memory_order_release);
+            }
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        }
+    } catch (...) {
+        foregroundStop.store(true, std::memory_order_release);
+    }
+}
+
+extern "C" void opendrop_qt_foreground_status(const char *message) noexcept {
+    try {
+        if (foregroundStatus && foregroundApp &&
+            QThread::currentThread() == foregroundApp->thread() && message) {
+            foregroundStatus->setText(QString::fromUtf8(message));
+        }
+    } catch (...) {
+        foregroundStop.store(true, std::memory_order_release);
+    }
+}
+
+extern "C" void opendrop_qt_foreground_shutdown() noexcept {
+    foregroundStatus = nullptr;
+    foregroundWindow.reset();
+    foregroundApp.reset();
+}
 
 namespace {
 
@@ -84,12 +181,15 @@ extern "C" int opendrop_qt_present_owner_consent(
     const char *initialDestination,
     int (*pinOwnerDirectory)(void *, const char *, size_t),
     void *pinContext,
+    int (*transportStillActive)(const void *),
+    const void *transportContext,
     char *destinationOut,
     size_t destinationCapacity) noexcept {
     try {
         if (!claimedDevice || !peerFingerprint || !transferId ||
             !fileName || !fileSha256 || !initialDestination ||
             !pinOwnerDirectory || !pinContext ||
+            !transportStillActive || !transportContext ||
             !destinationOut || destinationCapacity < 2) {
             return -1;
         }
@@ -116,6 +216,16 @@ extern "C" int opendrop_qt_present_owner_consent(
             QString::fromUtf8(initialDestination)
         };
         opendrop::IncomingOfferDialog dialog(std::move(details));
+        QTimer transportWatch(&dialog);
+        QObject::connect(&transportWatch, &QTimer::timeout, &dialog, [&dialog,
+            transportStillActive, transportContext]() {
+            if (caughtShutdownSignal != 0 ||
+                foregroundStop.load(std::memory_order_acquire) ||
+                transportStillActive(transportContext) != 1) {
+                dialog.reject();
+            }
+        });
+        transportWatch.start(150);
         dialog.setLocalDirectoryPin([pinOwnerDirectory, pinContext](
                                         const QString &selected) {
             const QByteArray bytes = selected.toUtf8();

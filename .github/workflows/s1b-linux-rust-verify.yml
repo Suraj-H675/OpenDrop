@@ -53,6 +53,9 @@ jobs:
       - name: Compile and test shared core and Linux receiver
         run: cargo test -p opendrop-core -p opendrop-linux-receiver --locked
 
+      - name: Link the actual foreground Linux receiver executable
+        run: cargo build -p opendrop-linux-receiver --bin opendrop-linux-receiver --locked
+
       - name: Compile and test native Qt owner dialog (headless synthetic)
         shell: bash
         run: |

@@ -22,4 +22,12 @@ if(OPENDROP_BUILD_QT_TESTS)
     add_test(NAME owner_dialog_event_boundary COMMAND opendrop-qt-owner-dialog-test)
     set_tests_properties(owner_dialog_event_boundary PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    add_executable(opendrop-qt-foreground-lifecycle-test QtForegroundLifecycleTest.cpp)
+    target_compile_features(opendrop-qt-foreground-lifecycle-test PRIVATE cxx_std_17)
+    target_link_libraries(opendrop-qt-foreground-lifecycle-test PRIVATE
+        opendrop-linux-owner-prompt Qt6::Test)
+    add_test(NAME foreground_window_shutdown COMMAND opendrop-qt-foreground-lifecycle-test)
+    set_tests_properties(foreground_window_shutdown PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()
