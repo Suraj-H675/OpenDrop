@@ -1,10 +1,12 @@
-//! OpenDrop P1-A: platform-independent identity policy and durable transfer
-//! journal. This is NOT an on-wire protocol, a keystore or a file-transfer app.
+//! OpenDrop shared identity, security policy, durable journal, and S1 transfer
+//! contracts. No native consent issuer, app transport, or OS file adapter yet.
 
 pub mod authorization;
 pub mod identity;
 pub mod journal;
 pub mod policy;
+pub mod receiver;
+pub mod wire;
 
 #[cfg(test)]
 mod durable_receipts_tests;
