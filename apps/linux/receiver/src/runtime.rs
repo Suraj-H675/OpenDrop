@@ -10,11 +10,11 @@ use opendrop_linux_receiver::tls::load_provisioned_tls;
 use opendrop_linux_receiver::{ForegroundLinuxReceiver, SessionCancellation};
 use rustls::{ServerConnection, StreamOwned};
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc::{self, Receiver, SyncSender, TryRecvError},
+    mpsc::{self, SyncSender, TryRecvError},
     Arc,
 };
 use std::thread;

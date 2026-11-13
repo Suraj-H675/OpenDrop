@@ -556,6 +556,7 @@ mod tests {
 
     #[test]
     fn legacy_stage_without_destination_identity_remains_unverifiable() {
+        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let dir = File::open(root.path()).unwrap();
         let (identity, offer) = fixture();
@@ -571,7 +572,9 @@ mod tests {
             offer.sha256.as_str(),
             offer.name,
         );
-        std::fs::write(root.path().join(meta_name(&identity).unwrap()), legacy).unwrap();
+        let path = root.path().join(meta_name(&identity).unwrap());
+        std::fs::write(&path, legacy).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let parsed = decode(&dir, &meta_name(&identity).unwrap()).unwrap();
         assert_eq!(parsed.offer, offer);
         assert!(parsed.approved_destination.is_none());
