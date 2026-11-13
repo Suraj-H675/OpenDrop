@@ -6,6 +6,7 @@
 #include <QPushButton>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <utility>
 
 namespace opendrop {
 
@@ -70,7 +71,8 @@ IncomingOfferDialog::IncomingOfferDialog(IncomingOfferView offer, QWidget *paren
     // UI result. Merely calling QDialog::accept() cannot return a usable
     // owner-action selection through selectedDirectoryAfterAcceptance().
     connect(buttons->button(QDialogButtonBox::Ok), &QPushButton::clicked, this, [this]() {
-        if (selectedDirectory_.isEmpty() || !isVisible()) {
+        if (selectedDirectory_.isEmpty() || !isVisible() ||
+            !pinDirectory_ || !pinDirectory_(selectedDirectory_)) {
             return; // no destination was selected by the owner
         }
         acceptedFromUi_ = true;
@@ -79,6 +81,11 @@ IncomingOfferDialog::IncomingOfferDialog(IncomingOfferView offer, QWidget *paren
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     // Full UI expiration must later be bound to the core session/offer lease.
     QTimer::singleShot(120000, this, &QDialog::reject);
+}
+
+void IncomingOfferDialog::setLocalDirectoryPin(
+    std::function<bool(const QString &)> pin) {
+    pinDirectory_ = std::move(pin);
 }
 
 QString IncomingOfferDialog::selectedDirectoryAfterAcceptance() const {

@@ -126,12 +126,11 @@ impl ForegroundLinuxReceiver {
                 return Err(error);
             }
         };
-        // Open a pinned, owner-verified directory before reserving the offer.
-        // A path rejected for symlinks, ownership or permissions does not
-        // create a usable authorized transfer.
+        // Use the descriptor pinned inside the Qt Accept event. Never reopen
+        // the display path, which could be replaced after the owner clicks.
         let updated_store = match self
             .store
-            .with_owner_selected_destination(grant.selected_directory())
+            .with_pinned_owner_destination(grant.selected_directory(), grant.pinned_directory())
         {
             Ok(store) => store,
             Err(error) => {
@@ -142,6 +141,7 @@ impl ForegroundLinuxReceiver {
         let (ticket, destination) = grant.into_parts();
         if !self.transport_active.load(Ordering::Acquire)
             || destination.owner_approved_directory() != updated_store.owner_destination_display()
+            || !destination.matches_pinned_directory(updated_store.pinned_destination())?
         {
             self.coordinator.decline_locally()?;
             return Err(Error::Unauthorized);
@@ -230,6 +230,9 @@ impl ForegroundLinuxReceiver {
         }
         let destination = self.destination.as_ref().ok_or(Error::Unauthorized)?;
         if destination.owner_approved_directory() != self.store.owner_destination_display() {
+            return Err(Error::Unauthorized);
+        }
+        if !destination.matches_pinned_directory(self.store.pinned_destination())? {
             return Err(Error::Unauthorized);
         }
         let publisher = self.publisher.as_mut().ok_or(Error::InvalidState)?;

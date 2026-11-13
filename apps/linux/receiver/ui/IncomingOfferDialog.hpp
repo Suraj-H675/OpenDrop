@@ -2,6 +2,7 @@
 
 #include <QDialog>
 #include <QString>
+#include <functional>
 
 namespace opendrop {
 
@@ -23,11 +24,17 @@ class IncomingOfferDialog final : public QDialog {
 public:
     explicit IncomingOfferDialog(IncomingOfferView offer, QWidget *parent = nullptr);
 
+    // The in-process Rust authority installs a folder pin callback before
+    // exec(). Only a successful pinned, owner-checked directory allows the
+    // actual Accept-button click to close this modal as approved.
+    void setLocalDirectoryPin(std::function<bool(const QString &)> pin);
+
     QString selectedDirectoryAfterAcceptance() const;
 
 private:
     QString selectedDirectory_;
     bool acceptedFromUi_ = false;
+    std::function<bool(const QString &)> pinDirectory_;
 };
 
 } // namespace opendrop

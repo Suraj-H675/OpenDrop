@@ -146,12 +146,16 @@ impl LinuxReceiverStorage {
         &self.destination_label
     }
 
-    /// Rebind a locally selected Qt destination to a PINNED owner-verified
-    /// directory descriptor. Both the stage root lock and its inode survive
-    /// the transition; the old directory path is no longer used for writes.
-    /// Remote offer names never select this directory.
-    pub fn with_owner_selected_destination(&self, selected: &Path) -> Result<Self, Error> {
-        let destination = open_owner_directory(selected, false)?;
+    /// Reuse the exact owner-verified directory descriptor opened DURING
+    /// the Qt Accept button handler. The path is display-only; never reopen
+    /// it after the click, when it could have been replaced.
+    pub fn with_pinned_owner_destination(
+        &self,
+        selected: &Path,
+        pinned: &File,
+    ) -> Result<Self, Error> {
+        verified_dir(pinned, false)?;
+        let destination = pinned.try_clone()?;
         Ok(Self {
             directories: Arc::new(OwnedDirectories {
                 stage: self.directories.stage.try_clone()?,
@@ -159,6 +163,10 @@ impl LinuxReceiverStorage {
             }),
             destination_label: Arc::new(selected.to_owned()),
         })
+    }
+
+    pub fn pinned_destination(&self) -> &File {
+        &self.directories.destination
     }
 
     pub fn allocate(
@@ -501,7 +509,10 @@ mod tests {
         let moved = choices.path().join("original-inode");
         std::fs::create_dir(&selected).unwrap();
         let original = LinuxReceiverStorage::open_private(private.path(), first.path()).unwrap();
-        let approved = original.with_owner_selected_destination(&selected).unwrap();
+        let pinned = open_owner_directory(&selected, false).unwrap();
+        let approved = original
+            .with_pinned_owner_destination(&selected, &pinned)
+            .unwrap();
         assert_eq!(approved.owner_destination_display(), selected.as_path());
 
         // The chosen directory can be renamed by its owner while the

@@ -18,7 +18,9 @@ use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
 use std::{
-    ffi::{c_char, CString},
+    ffi::{c_char, c_void, CString},
+    fs::File,
+    os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -270,12 +272,16 @@ pub struct LinuxQtConsentGrant {
     ticket: ConsentTicket,
     destination: crate::receiver::LocalDestinationLease,
     selected_directory: PathBuf,
+    pinned_directory: File,
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
 impl LinuxQtConsentGrant {
     pub fn selected_directory(&self) -> &Path {
         &self.selected_directory
+    }
+    pub fn pinned_directory(&self) -> &File {
+        &self.pinned_directory
     }
     pub fn into_parts(self) -> (ConsentTicket, crate::receiver::LocalDestinationLease) {
         (self.ticket, self.destination)
@@ -320,6 +326,85 @@ fn qt_arg(text: &str) -> Result<CString, Error> {
     CString::new(text).map_err(|_| Error::Invalid("Qt display metadata"))
 }
 
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+fn pin_approved_owner_directory(path: &Path) -> Result<File, Error> {
+    use rustix::fs::{openat2, Mode, OFlags, ResolveFlags};
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(Error::Invalid("noncanonical owner destination"));
+    }
+    let relative = path
+        .strip_prefix("/")
+        .map_err(|_| Error::Invalid("owner destination path"))?;
+    let root = File::open("/")?;
+    let handle = openat2(
+        &root,
+        relative,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+    )
+    .map_err(|error| Error::Io(error.into()))?;
+    let directory = File::from(handle);
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(Error::Unauthorized);
+    }
+    Ok(directory)
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+#[derive(Default)]
+struct QtPinnedDestination {
+    selected: Option<(PathBuf, File)>,
+}
+
+// Called only while the bundled Qt dialog's own Accept-button handler runs.
+// It pins the selected path before reporting UI acceptance. The context is a
+// private stack object whose lifetime encloses the synchronous C++ modal.
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+unsafe extern "C" fn qt_pin_owner_directory(
+    context: *mut c_void,
+    path: *const c_char,
+    length: usize,
+) -> i32 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if context.is_null() || path.is_null() || length == 0 || length > 4096 {
+            return false;
+        }
+        // SAFETY: the linked C++ bridge provides valid pointers only during
+        // the synchronous modal. No other thread accesses this stack context.
+        let data = unsafe { std::slice::from_raw_parts(path as *const u8, length) };
+        let Ok(text) = std::str::from_utf8(data) else {
+            return false;
+        };
+        if text
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        {
+            return false;
+        }
+        let location = PathBuf::from(text);
+        let Ok(owned_directory) = pin_approved_owner_directory(&location) else {
+            return false;
+        };
+        let ctx = unsafe { &mut *(context as *mut QtPinnedDestination) };
+        ctx.selected = Some((location, owned_directory));
+        true
+    }));
+    if result.unwrap_or(false) {
+        1
+    } else {
+        0
+    }
+}
+
 // Native code presents the modal but never sees TLS exporter secrets or
 // constructs a ConsentTicket; no network/IPC entrypoint is registered.
 #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
@@ -332,6 +417,8 @@ extern "C" {
         hash: *const c_char,
         bytes: u64,
         initial_dir: *const c_char,
+        pin: unsafe extern "C" fn(*mut c_void, *const c_char, usize) -> i32,
+        pin_context: *mut c_void,
         selected_out: *mut c_char,
         capacity: usize,
     ) -> i32;
@@ -369,6 +456,7 @@ pub fn request_linux_qt_owner_consent(
     let checksum = qt_arg(prompt.offer.sha256.as_str())?;
     let initial_dir = qt_arg(initial)?;
     let mut selected = [0i8; 4097];
+    let mut pinned = QtPinnedDestination::default();
     // SAFETY: inputs live through this synchronous call; output is a writable
     // bounded buffer. The C++ ABI returns a status and a NUL-terminated path.
     let decision = unsafe {
@@ -380,6 +468,8 @@ pub fn request_linux_qt_owner_consent(
             checksum.as_ptr(),
             prompt.offer.bytes,
             initial_dir.as_ptr(),
+            qt_pin_owner_directory,
+            (&mut pinned as *mut QtPinnedDestination).cast::<c_void>(),
             selected.as_mut_ptr(),
             selected.len(),
         )
@@ -410,12 +500,19 @@ pub fn request_linux_qt_owner_consent(
     {
         return Err(Error::Invalid("Qt selected a noncanonical destination"));
     }
+    let (pinned_path, pinned_directory) = pinned.selected.ok_or(Error::Unauthorized)?;
+    if pinned_path != selected_path {
+        return Err(Error::Unauthorized);
+    }
+    let pinned_stat = pinned_directory.metadata()?;
     let binding = consent_binding(&prompt.session, &prompt.device, &prompt.offer);
     consume_qt_binding(binding)?;
     let destination = crate::receiver::LocalDestinationLease::from_local_qt_owner_action(
         &prompt.offer,
         selected_path.clone(),
         binding,
+        pinned_stat.dev(),
+        pinned_stat.ino(),
     )?;
     let ticket = ConsentTicket {
         offer: prompt.offer,
@@ -426,6 +523,7 @@ pub fn request_linux_qt_owner_consent(
         ticket,
         destination,
         selected_directory: selected_path,
+        pinned_directory,
     })
 }
 

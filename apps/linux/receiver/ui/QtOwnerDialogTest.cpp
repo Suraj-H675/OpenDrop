@@ -22,6 +22,7 @@ int main(int argc, char **argv) {
 
     {
         opendrop::IncomingOfferDialog dialog(view);
+        dialog.setLocalDirectoryPin([](const QString &) { return true; });
         QTimer::singleShot(0, &dialog, [&dialog] {
             dialog.accept(); // bypass the button: must never become consent
         });
@@ -32,6 +33,9 @@ int main(int argc, char **argv) {
     }
     {
         opendrop::IncomingOfferDialog dialog(view);
+        dialog.setLocalDirectoryPin([](const QString &path) {
+            return path == QStringLiteral("/tmp");
+        });
         QTimer::singleShot(0, &dialog, [&dialog] {
             auto *buttons = dialog.findChild<QDialogButtonBox *>();
             if (!buttons) {
@@ -47,10 +51,28 @@ int main(int argc, char **argv) {
     }
     {
         opendrop::IncomingOfferDialog dialog(view);
+        dialog.setLocalDirectoryPin([](const QString &) { return true; });
         QTimer::singleShot(0, &dialog, [&dialog] { dialog.reject(); });
         if (dialog.exec() != QDialog::Rejected ||
             !dialog.selectedDirectoryAfterAcceptance().isEmpty()) {
             return 3;
+        }
+    }
+    {
+        opendrop::IncomingOfferDialog dialog(view);
+        dialog.setLocalDirectoryPin([](const QString &) { return false; });
+        QTimer::singleShot(0, &dialog, [&dialog] {
+            auto *buttons = dialog.findChild<QDialogButtonBox *>();
+            if (buttons) {
+                QTest::mouseClick(buttons->button(QDialogButtonBox::Ok), Qt::LeftButton);
+            }
+            // The button was clicked, but Rust rejected the target folder:
+            // this may never be reported as an owner-approved transfer.
+            dialog.reject();
+        });
+        if (dialog.exec() != QDialog::Rejected ||
+            !dialog.selectedDirectoryAfterAcceptance().isEmpty()) {
+            return 4;
         }
     }
     return 0;

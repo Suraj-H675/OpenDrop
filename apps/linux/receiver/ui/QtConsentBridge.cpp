@@ -82,11 +82,14 @@ extern "C" int opendrop_qt_present_owner_consent(
     const char *fileSha256,
     unsigned long long byteCount,
     const char *initialDestination,
+    int (*pinOwnerDirectory)(void *, const char *, size_t),
+    void *pinContext,
     char *destinationOut,
     size_t destinationCapacity) noexcept {
     try {
         if (!claimedDevice || !peerFingerprint || !transferId ||
             !fileName || !fileSha256 || !initialDestination ||
+            !pinOwnerDirectory || !pinContext ||
             !destinationOut || destinationCapacity < 2) {
             return -1;
         }
@@ -113,6 +116,19 @@ extern "C" int opendrop_qt_present_owner_consent(
             QString::fromUtf8(initialDestination)
         };
         opendrop::IncomingOfferDialog dialog(std::move(details));
+        dialog.setLocalDirectoryPin([pinOwnerDirectory, pinContext](
+                                        const QString &selected) {
+            const QByteArray bytes = selected.toUtf8();
+            if (bytes.isEmpty() || bytes.size() > 4096 ||
+                bytes.contains('\0')) {
+                return false;
+            }
+            // This callback may ONLY pin and validate an owner directory.
+            // No approval capability is issued from the C++ widget.
+            return pinOwnerDirectory(
+                       pinContext, bytes.constData(),
+                       static_cast<size_t>(bytes.size())) == 1;
+        });
         if (dialog.exec() != QDialog::Accepted) {
             return 0;
         }

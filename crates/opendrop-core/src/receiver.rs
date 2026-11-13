@@ -1,10 +1,9 @@
 //! S1 receiver coordinator. No network frame can move this state machine
 //! through consent or committed publication.
 //!
-//! The genuine native local-user consent issuer and owner-approved Linux
-//! destination lease are deliberately NOT present yet. Until the audited
-//! adapters exist this path fails closed, rather than accepting a network
-//! boolean, a supplied path or a forged receipt.
+//! A feature-gated Linux in-process Qt owner action can issue a private
+//! exact-session/offer ticket and a pinned destination lease. Other platforms
+//! retain the shared protocol and do not inherit a network approval shortcut.
 
 use crate::authorization::{
     authorize_local_consent, review_incoming, AuthenticatedSession, AuthorizedOffer, ConsentPrompt,
@@ -64,6 +63,10 @@ pub struct LocalDestinationLease {
     approved_directory: std::path::PathBuf,
     #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
     session_offer_binding: [u8; 32],
+    #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+    directory_device: u64,
+    #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+    directory_inode: u64,
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
@@ -74,6 +77,8 @@ impl LocalDestinationLease {
         offer: &FileOffer,
         selected_directory: std::path::PathBuf,
         binding: [u8; 32],
+        directory_device: u64,
+        directory_inode: u64,
     ) -> Result<Self, Error> {
         offer.validate()?;
         if !selected_directory.is_absolute() {
@@ -83,11 +88,25 @@ impl LocalDestinationLease {
             reference: offer.name.clone(),
             approved_directory: selected_directory,
             session_offer_binding: binding,
+            directory_device,
+            directory_inode,
         })
     }
 
     pub fn owner_approved_directory(&self) -> &std::path::Path {
         &self.approved_directory
+    }
+
+    /// This lease can only be used with the inode pinned at the Qt click.
+    /// Subsequent path renames/replacements cannot redirect publication.
+    pub fn matches_pinned_directory(&self, pinned: &std::fs::File) -> Result<bool, Error> {
+        use std::os::unix::fs::MetadataExt;
+        let info = pinned.metadata()?;
+        Ok(info.is_dir()
+            && info.dev() == self.directory_device
+            && info.ino() == self.directory_inode
+            && info.uid() == rustix::process::geteuid().as_raw()
+            && info.mode() & 0o022 == 0)
     }
 }
 
@@ -516,6 +535,47 @@ fn validate_end_control(offer: &FileOffer, end: &Control) -> Result<(), Error> {
     match end {
         Control::End(id) if id == &offer.id => Ok(()),
         _ => Err(Error::Invalid("S1 exact End control required")),
+    }
+}
+
+#[cfg(all(test, target_os = "linux", feature = "linux-qt-consent"))]
+mod native_destination_identity_tests {
+    use super::*;
+    use crate::identity::{KeyFingerprint, Sha256Digest, TransferId};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn lease_rejects_replaced_directory_inodes_and_weakened_permissions() {
+        let owned = tempfile::tempdir().unwrap();
+        let chosen = owned.path().join("chosen");
+        let moved = owned.path().join("previous-inode");
+        std::fs::create_dir(&chosen).unwrap();
+        let original = std::fs::File::open(&chosen).unwrap();
+        let info = original.metadata().unwrap();
+        let offer = FileOffer {
+            id: TransferId::parse(&"a".repeat(32)).unwrap(),
+            peer: KeyFingerprint::parse(&"b".repeat(64)).unwrap(),
+            manifest: Sha256Digest::parse(&"c".repeat(64)).unwrap(),
+            name: "file.txt".to_owned(),
+            bytes: 4,
+            sha256: Sha256Digest::parse(&"d".repeat(64)).unwrap(),
+        };
+        let lease = LocalDestinationLease::from_local_qt_owner_action(
+            &offer,
+            chosen.clone(),
+            [8; 32],
+            info.dev(),
+            info.ino(),
+        )
+        .unwrap();
+        assert!(lease.matches_pinned_directory(&original).unwrap());
+        std::fs::rename(&chosen, &moved).unwrap();
+        std::fs::create_dir(&chosen).unwrap();
+        let replacement = std::fs::File::open(&chosen).unwrap();
+        assert!(!lease.matches_pinned_directory(&replacement).unwrap());
+        assert!(lease.matches_pinned_directory(&original).unwrap());
+        std::fs::set_permissions(&moved, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!lease.matches_pinned_directory(&original).unwrap());
     }
 }
 
