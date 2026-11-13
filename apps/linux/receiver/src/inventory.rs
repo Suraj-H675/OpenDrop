@@ -89,7 +89,7 @@ pub(crate) fn persist(
     let fd = openat(
         dir,
         name.as_str(),
-        OFlags::WRONLY | OFlags::CREAT | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o600),
     )
     .map_err(|error| Error::Io(error.into()))?;

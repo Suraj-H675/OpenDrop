@@ -168,7 +168,7 @@ impl LinuxReceiverStorage {
         let fd = openat(
             &self.directories.stage,
             name.as_str(),
-            OFlags::WRONLY | OFlags::CREAT | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::from_raw_mode(STAGE_FILE_MODE),
         )
         .map_err(io)?;
