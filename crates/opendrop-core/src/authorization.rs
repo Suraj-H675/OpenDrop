@@ -13,6 +13,8 @@ use crate::Error;
 use rustls::server::ServerConnection;
 use rustls::ProtocolVersion;
 use sha2::{Digest, Sha256};
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+use std::collections::HashMap;
 #[cfg(any(test, all(target_os = "linux", feature = "linux-qt-consent")))]
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,7 +26,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock, Weak,
     },
     time::Duration,
 };
@@ -330,21 +332,31 @@ fn within_qt_owner_deadline(start: i128, end: i128, active: bool) -> bool {
     active && end >= start && end - start < (LINUX_QT_CONSENT_TTL.as_nanos() as i128)
 }
 
-// Bounded replay ledger for the lifetime of the TLS-owning process. A fresh
-// process cannot recreate an old exporter without the original TLS session.
+// Bounded replay ledger for the lifetime of each LIVE TLS connection. Dead
+// sessions are reaped on the next consent: a long-running foreground app can
+// receive indefinitely without exhausting a lifetime-only HashSet. The
+// binding cannot be reissued while the same authenticated session is active.
 #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
-static QT_CONSUMED: OnceLock<Mutex<HashSet<[u8; 32]>>> = OnceLock::new();
+static QT_CONSUMED: OnceLock<Mutex<HashMap<[u8; 32], Weak<AtomicBool>>>> = OnceLock::new();
 
 #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
-fn consume_qt_binding(binding: [u8; 32]) -> Result<(), Error> {
+fn consume_qt_binding(binding: [u8; 32], active: &Arc<AtomicBool>) -> Result<(), Error> {
     let mut consumed = QT_CONSUMED
-        .get_or_init(|| Mutex::new(HashSet::new()))
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .map_err(|_| Error::Unauthorized)?;
-    if consumed.contains(&binding) || consumed.len() >= 4096 {
+    consumed.retain(|_, handle| {
+        handle
+            .upgrade()
+            .is_some_and(|transport| transport.load(Ordering::Acquire))
+    });
+    if !active.load(Ordering::Acquire) {
         return Err(Error::Unauthorized);
     }
-    consumed.insert(binding);
+    if consumed.contains_key(&binding) || consumed.len() >= 4096 {
+        return Err(Error::Unauthorized);
+    }
+    consumed.insert(binding, Arc::downgrade(active));
     Ok(())
 }
 
@@ -474,7 +486,7 @@ extern "C" {
 pub fn request_linux_qt_owner_consent(
     prompt: ConsentPrompt,
     initial_destination: &Path,
-    transport_active: &AtomicBool,
+    transport_active: &Arc<AtomicBool>,
 ) -> Result<LinuxQtConsentGrant, Error> {
     if !transport_active.load(Ordering::Acquire) {
         return Err(Error::Unauthorized);
@@ -511,7 +523,7 @@ pub fn request_linux_qt_owner_consent(
             qt_pin_owner_directory,
             (&mut pinned as *mut QtPinnedDestination).cast::<c_void>(),
             qt_transport_still_active,
-            (transport_active as *const AtomicBool).cast::<c_void>(),
+            (transport_active.as_ref() as *const AtomicBool).cast::<c_void>(),
             selected.as_mut_ptr(),
             selected.len(),
         )
@@ -548,7 +560,7 @@ pub fn request_linux_qt_owner_consent(
     }
     let pinned_stat = pinned_directory.metadata()?;
     let binding = consent_binding(&prompt.session, &prompt.device, &prompt.offer);
-    consume_qt_binding(binding)?;
+    consume_qt_binding(binding, transport_active)?;
     let destination = crate::receiver::LocalDestinationLease::from_local_qt_owner_action(
         &prompt.offer,
         selected_path.clone(),
@@ -600,8 +612,15 @@ mod linux_qt_authority_tests {
         let claimed = DeviceId::parse(&"1".repeat(32)).unwrap();
         let mut first_exporter = [7u8; 32];
         let first = consent_binding(&first_exporter, &claimed, &offer(&"a".repeat(32)));
-        assert!(consume_qt_binding(first).is_ok());
-        assert!(consume_qt_binding(first).is_err());
+        let connection = Arc::new(AtomicBool::new(true));
+        assert!(consume_qt_binding(first, &connection).is_ok());
+        assert!(consume_qt_binding(first, &connection).is_err());
+        // The same TLS connection cannot mint twice; finished connections
+        // are reaped so long-running apps do not hit the 4096 lifetime cap.
+        connection.store(false, Ordering::Release);
+        let new_connection = Arc::new(AtomicBool::new(true));
+        assert!(consume_qt_binding(first, &new_connection).is_ok());
+        assert!(consume_qt_binding(first, &new_connection).is_err());
         first_exporter[0] = 8;
         let other_session = consent_binding(&first_exporter, &claimed, &offer(&"a".repeat(32)));
         let other_offer = consent_binding(&[7u8; 32], &claimed, &offer(&"e".repeat(32)));
@@ -632,7 +651,7 @@ mod linux_qt_authority_tests {
             session: [3u8; 32],
             device: claimed,
         };
-        let disconnected = AtomicBool::new(false);
+        let disconnected = Arc::new(AtomicBool::new(false));
         assert!(matches!(
             request_linux_qt_owner_consent(prompt, Path::new("/tmp"), &disconnected),
             Err(Error::Unauthorized)
