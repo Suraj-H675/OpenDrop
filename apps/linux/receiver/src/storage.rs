@@ -410,7 +410,37 @@ impl DurablePublisher for LinuxNativePublisher {
 mod tests {
     use super::*;
     use opendrop_core::identity::{KeyFingerprint, TransferId};
-    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Filesystem fixtures must match the production private-root contract.
+    /// `tempfile::tempdir()` requests 0777 (umask-dependent), not 0700.
+    fn private_stage_root() -> tempfile::TempDir {
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let metadata = root.path().metadata().unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        root
+    }
+
+    #[test]
+    fn overly_permissive_private_staging_root_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        // Only change this test's disposable directory; keep the production
+        // owner-only guard unchanged and verify the actual mode we test.
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let metadata = root.path().metadata().unwrap();
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
+        let destination = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            LinuxReceiverStorage::open_private(root.path(), destination.path()),
+            Err(Error::Invalid("Linux directory has unsafe permissions"))
+        ));
+    }
 
     fn offer(bytes: &[u8], name: &str) -> FileOffer {
         FileOffer {
@@ -425,7 +455,7 @@ mod tests {
 
     #[test]
     fn stage_and_publish_no_replace_and_verify_destination_bytes() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_stage_root();
         let dest = tempfile::tempdir().unwrap();
         let storage = LinuxReceiverStorage::open_private(root.path(), dest.path()).unwrap();
         let offered = offer(b"hello world", "report.txt");
@@ -448,7 +478,7 @@ mod tests {
 
     #[test]
     fn collision_does_not_replace_unrelated_existing_file() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_stage_root();
         let dest = tempfile::tempdir().unwrap();
         let store = LinuxReceiverStorage::open_private(root.path(), dest.path()).unwrap();
         let offered = offer(b"new", "same.txt");
@@ -467,7 +497,7 @@ mod tests {
     #[test]
     fn cannot_open_symlinked_storage_directory_or_stage_name() {
         use std::os::unix::fs::symlink;
-        let private = tempfile::tempdir().unwrap();
+        let private = private_stage_root();
         let dest = tempfile::tempdir().unwrap();
         let symlink_dir = private.path().join("link");
         symlink(dest.path(), &symlink_dir).unwrap();
@@ -490,7 +520,7 @@ mod tests {
 
     #[test]
     fn stage_enforces_total_bytes_and_rejects_path_from_offer() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_stage_root();
         let dest = tempfile::tempdir().unwrap();
         let storage = LinuxReceiverStorage::open_private(root.path(), dest.path()).unwrap();
         assert!(storage.allocate(&offer(b"x", "../escape")).is_err());
@@ -505,7 +535,7 @@ mod tests {
 
     #[test]
     fn a_mismatching_staged_digest_never_returns_durable_publish_evidence() {
-        let private = tempfile::tempdir().unwrap();
+        let private = private_stage_root();
         let output = tempfile::tempdir().unwrap();
         let storage = LinuxReceiverStorage::open_private(private.path(), output.path()).unwrap();
         let offered = offer(b"good", "hash-check.bin");
@@ -529,7 +559,7 @@ mod tests {
     #[test]
     fn restart_without_journal_evidence_preserves_private_stage() {
         use opendrop_core::journal::Journal;
-        let private = tempfile::tempdir().unwrap();
+        let private = private_stage_root();
         let destination = tempfile::tempdir().unwrap();
         let foreign = destination.path().join("unrelated.bin");
         std::fs::write(&foreign, b"keep").unwrap();
