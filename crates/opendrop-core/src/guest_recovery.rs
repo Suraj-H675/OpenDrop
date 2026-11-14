@@ -12,11 +12,19 @@ use crate::guest_tls::{VerifiedGuestSession, VerifiedReceiptOnlyTls};
 use crate::identity::{validate_file_name, KeyFingerprint, Sha256Digest, TransferId};
 use crate::journal::{FileOffer, Journal, Receipt};
 use crate::Error;
-use ring::constant_time::verify_slices_are_equal;
+use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_RECOVERY_MILLIS: i64 = 24 * 60 * 60 * 1000;
+
+fn authoritative_local_now_millis() -> Result<i64, Error> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Error::Unauthorized)?;
+    i64::try_from(elapsed.as_millis()).map_err(|_| Error::Unauthorized)
+}
 
 /// Versioned GuestV1 offer. The accepted S1-A FileOffer remains unchanged,
 /// but a guest SPKI is NEVER inferred from a legacy certificate fingerprint:
@@ -137,14 +145,34 @@ impl GuestRecoveryScope {
         &self.offer_digest
     }
     pub(crate) fn verifier(&self, token: &GuestRecoveryCredential) -> [u8; 32] {
-        let mut hash = Sha256::new();
-        hash.update(b"OpenDrop/S1/GuestReceiptVerifier/v1\0");
-        hash.update(self.offer.id().as_str().as_bytes());
-        hash.update(self.sender_spki.as_der());
-        hash.update(self.receiver_spki.as_der());
-        hash.update(self.offer_digest);
-        hash.update(token.as_bytes());
-        hash.finalize().into()
+        let input = self.verifier_input();
+        let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, token.as_bytes()), &input);
+        tag.as_ref()
+            .try_into()
+            .expect("HMAC-SHA256 verifier is 32 bytes")
+    }
+
+    fn verifier_input(&self) -> Vec<u8> {
+        let mut input = Vec::with_capacity(32 + 32 + 91 + 91 + 32);
+        input.extend_from_slice(b"OpenDrop/S1/GuestReceiptVerifier/v1\0");
+        input.extend_from_slice(self.offer.id().as_str().as_bytes());
+        input.extend_from_slice(self.sender_spki.as_der());
+        input.extend_from_slice(self.receiver_spki.as_der());
+        input.extend_from_slice(&self.offer_digest);
+        input
+    }
+
+    pub(crate) fn verify_saved_verifier(
+        &self,
+        token: &GuestRecoveryCredential,
+        stored: &[u8],
+    ) -> bool {
+        hmac::verify(
+            &hmac::Key::new(hmac::HMAC_SHA256, token.as_bytes()),
+            &self.verifier_input(),
+            stored,
+        )
+        .is_ok()
     }
 }
 
@@ -204,15 +232,13 @@ impl GuestAuthorizedTransfer {
         &self,
         journal: &mut Journal,
         token: &GuestRecoveryCredential,
-        issued_ms: i64,
-        recovery_millis: i64,
     ) -> Result<(), Error> {
         if !self.session.is_active() {
             return Err(Error::Unauthorized);
         }
-        if recovery_millis <= 0 || recovery_millis > MAX_RECOVERY_MILLIS {
-            return Err(Error::Invalid("guest recovery lifetime"));
-        }
+        // Never accept a network/UI caller-supplied clock or expiry.
+        let issued_ms = authoritative_local_now_millis()?;
+        let recovery_millis = MAX_RECOVERY_MILLIS;
         if issued_ms < 0 || issued_ms.checked_add(recovery_millis).is_none() {
             return Err(Error::Invalid("guest recovery clock"));
         }
@@ -259,7 +285,6 @@ impl Journal {
         pinned_tls: &VerifiedReceiptOnlyTls,
         scope: &GuestRecoveryScope,
         token: &GuestRecoveryCredential,
-        now_ms: i64,
     ) -> Result<Option<GuestCommittedReceipt>, Error> {
         if !pinned_tls.is_active()
             || pinned_tls.peer_public_key() != scope.sender_key()
@@ -267,7 +292,9 @@ impl Journal {
         {
             return Err(Error::Unauthorized);
         }
-        self.read_guest_committed_receipt_exact(scope, scope.verifier(token), now_ms)
+        // Expiry is enforced by the receiver's own clock, never the sender's.
+        let now_ms = authoritative_local_now_millis()?;
+        self.read_guest_committed_receipt_exact(scope, token, now_ms)
             .map(|receipt| {
                 receipt
                     .map(|r| GuestCommittedReceipt::from_checked_receipt(r, scope.offer.sender()))
@@ -360,14 +387,14 @@ mod tests {
                 )
                 .unwrap();
             assert!(journal
-                .read_guest_committed_receipt_exact(&scope, scope.verifier(&secret), issued + 1,)
+                .read_guest_committed_receipt_exact(&scope, &secret, issued + 1,)
                 .unwrap()
                 .is_none());
             journal
                 .record_commit_intent(scope.offer.journal_offer(), "guest.txt")
                 .unwrap();
             assert!(journal
-                .read_guest_committed_receipt_exact(&scope, scope.verifier(&secret), issued + 1,)
+                .read_guest_committed_receipt_exact(&scope, &secret, issued + 1,)
                 .unwrap()
                 .is_none());
             journal
@@ -381,7 +408,7 @@ mod tests {
             .unwrap();
         assert_eq!(reloaded.offer_digest(), scope.offer_digest());
         let result = restarted
-            .read_guest_committed_receipt_exact(&reloaded, reloaded.verifier(&secret), issued + 1)
+            .read_guest_committed_receipt_exact(&reloaded, &secret, issued + 1)
             .unwrap()
             .unwrap();
         assert_eq!(result.transfer_id, scope.offer.transfer.id);
@@ -425,28 +452,24 @@ mod tests {
             )
             .is_err());
         assert!(journal
-            .read_guest_committed_receipt_exact(&scope, scope.verifier(&wrong), 501)
+            .read_guest_committed_receipt_exact(&scope, &wrong, 501)
             .is_err());
         assert!(journal
-            .read_guest_committed_receipt_exact(&scope, scope.verifier(&good), 499)
+            .read_guest_committed_receipt_exact(&scope, &good, 499)
             .is_err());
         assert!(journal
-            .read_guest_committed_receipt_exact(
-                &scope,
-                scope.verifier(&good),
-                500 + MAX_RECOVERY_MILLIS,
-            )
+            .read_guest_committed_receipt_exact(&scope, &good, 500 + MAX_RECOVERY_MILLIS,)
             .is_err());
         let mut swapped = test_scope();
         swapped.receiver_spki = test_spki(9);
         assert!(journal
-            .read_guest_committed_receipt_exact(&swapped, scope.verifier(&good), 501)
+            .read_guest_committed_receipt_exact(&swapped, &good, 501)
             .is_err());
         let mut altered = test_scope();
         altered.offer.transfer.bytes += 1;
         altered.offer_digest = altered.offer.canonical_digest();
         assert!(journal
-            .read_guest_committed_receipt_exact(&altered, scope.verifier(&good), 501)
+            .read_guest_committed_receipt_exact(&altered, &good, 501)
             .is_err());
     }
 }

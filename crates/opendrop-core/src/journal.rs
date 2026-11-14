@@ -2,12 +2,13 @@
 //! A native destination adapter must durably publish and re-open/hash the
 //! actual file before returning its evidence to this journal.
 
-use crate::guest::{GuestSpkiFingerprint, P256Spki};
-use crate::guest_recovery::{GuestOfferV1, GuestRecoveryScope, MAX_RECOVERY_MILLIS};
+use crate::guest::P256Spki;
+use crate::guest_recovery::{
+    GuestOfferV1, GuestRecoveryCredential, GuestRecoveryScope, MAX_RECOVERY_MILLIS,
+};
 use crate::identity::{validate_file_name, DeviceId, KeyFingerprint, Sha256Digest, TransferId};
 use crate::policy::{self, PrivateVisibility, ReceiveDecision, Visibility};
 use crate::Error;
-use ring::constant_time::verify_slices_are_equal;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
@@ -310,7 +311,7 @@ impl Journal {
         if existing.0 != scope.sender_spki.as_der()
             || existing.1 != scope.receiver_spki.as_der()
             || existing.2.as_slice() != scope.offer_digest()
-            || verify_slices_are_equal(&existing.3, &verifier).is_err()
+            || existing.3.as_slice() != verifier
             || existing.4 != issued_ms
             || existing.5 != expires_ms
         {
@@ -394,7 +395,7 @@ impl Journal {
     pub(crate) fn read_guest_committed_receipt_exact(
         &self,
         scope: &GuestRecoveryScope,
-        verifier: [u8; 32],
+        token: &GuestRecoveryCredential,
         now_ms: i64,
     ) -> Result<Option<Receipt>, Error> {
         if now_ms < 0 {
@@ -429,7 +430,7 @@ impl Journal {
             || sender != scope.sender_spki.as_der()
             || receiver != scope.receiver_spki.as_der()
             || digest.as_slice() != scope.offer_digest()
-            || verify_slices_are_equal(&saved_verifier, &verifier).is_err()
+            || !scope.verify_saved_verifier(token, &saved_verifier)
         {
             return Err(Error::Unauthorized);
         }

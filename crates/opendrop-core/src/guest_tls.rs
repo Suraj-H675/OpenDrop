@@ -15,7 +15,6 @@ use crate::guest::{
 };
 use crate::identity::DeviceId;
 use crate::Error;
-use ring::constant_time::verify_slices_are_equal;
 use ring::hmac;
 use ring::signature::{self, UnparsedPublicKey};
 use rustls::client::danger::HandshakeSignatureValid;
@@ -65,7 +64,7 @@ impl LocalGuestIdentity {
         let public = P256Spki::from_canonical_der(&signer.canonical_public_spki_der()?)?;
         let challenge = b"OpenDrop/S1/P256/LocalSigningKeyProof/v1";
         let proof = signer.sign_ecdsa_p256_sha256_der(challenge)?;
-        UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, &public.as_der()[27..])
+        UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, &public.as_der()[26..])
             .verify(challenge, &proof)
             .map_err(|_| Error::Unauthorized)?;
         Ok(Self {
@@ -151,7 +150,7 @@ impl Signer for P256RustlsSigner {
         // arbitrary TLS signature or identity claim succeed.
         UnparsedPublicKey::new(
             &signature::ECDSA_P256_SHA256_ASN1,
-            &self.spki.as_der()[27..],
+            &self.spki.as_der()[26..],
         )
         .verify(message, &signature)
         .map_err(|_| rustls::Error::General("native P-256 signature/key mismatch".into()))?;
@@ -665,11 +664,16 @@ impl GuestConfirmation {
     }
 }
 
-fn confirmation_mac(key: &[u8; 32], binding: &[u8; 32], role: TlsSide) -> [u8; 32] {
+fn confirmation_input(binding: &[u8; 32], role: TlsSide) -> Vec<u8> {
     let mut input = Vec::with_capacity(65);
     input.extend_from_slice(b"OpenDrop/S1/VerifiedUserConfirmation/v1\0");
     input.extend_from_slice(binding);
     input.push(role as u8);
+    input
+}
+
+fn confirmation_mac(key: &[u8; 32], binding: &[u8; 32], role: TlsSide) -> [u8; 32] {
+    let input = confirmation_input(binding, role);
     let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), &input);
     tag.as_ref()
         .try_into()
@@ -713,12 +717,14 @@ impl AwaitingPeerConfirmation {
             TlsSide::Client => TlsSide::Server,
             TlsSide::Server => TlsSide::Client,
         };
-        let expected = confirmation_mac(
-            &self.provisional.proof_key,
-            &self.provisional.transcript_hash,
-            opposite,
-        );
-        if peer.0[5] != opposite as u8 || verify_slices_are_equal(&peer.0[6..], &expected).is_err()
+        let expected_input = confirmation_input(&self.provisional.transcript_hash, opposite);
+        if peer.0[5] != opposite as u8
+            || hmac::verify(
+                &hmac::Key::new(hmac::HMAC_SHA256, &self.provisional.proof_key),
+                &expected_input,
+                &peer.0[6..],
+            )
+            .is_err()
         {
             return Err(Error::Unauthorized);
         }
@@ -987,7 +993,7 @@ mod tests {
 
     #[test]
     fn wrong_introduced_key_is_rejected_by_tls_before_any_sas_or_offer() {
-        let (sender, receiver, _correct, mut client, mut server) = tls_pair();
+        let (sender, receiver, _correct, _unused_client, mut server) = tls_pair();
         let attacker = identity('c');
         let forged = GuestTranscript::new(
             sender
@@ -1000,7 +1006,7 @@ mod tests {
         .unwrap();
         // Sender pins one server RPK, but the actual TLS server signs with
         // another RPK. The rustls verifier must NOT return an assertion.
-        client = ClientConnection::new(
+        let mut client = ClientConnection::new(
             client_config(&sender, &forged).unwrap(),
             ServerName::try_from("opendrop.invalid").unwrap().to_owned(),
         )
