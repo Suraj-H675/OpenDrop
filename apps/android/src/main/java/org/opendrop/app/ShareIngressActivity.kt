@@ -28,8 +28,14 @@ class ShareIngressActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         var error: String? = null
-        try { sources = ShareSource.parse(intent, contentResolver) }
-        catch (_: Exception) { error = "This share could not be opened: missing/revoked grant or unsupported content." }
+        if (intent.action == android.content.Intent.ACTION_MAIN) {
+            sources = emptyList() // recovery-only after restart; never resend automatically
+        } else {
+            try { sources = ShareSource.parse(intent, contentResolver) }
+            catch (_: Exception) {
+                error = "This share could not be opened: missing/revoked grant or unsupported content."
+            }
+        }
 
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -40,7 +46,9 @@ class ShareIngressActivity : Activity() {
             textSize = 22f
         })
         column.addView(TextView(this).apply {
-            text = if (error == null)
+            text = if (error == null && sources.isEmpty())
+                "Recover a previous completion without sending again. Enter the original receiver's LAN address."
+            else if (error == null)
                 sources.joinToString("\n") { "${it.name} · ${it.mime} · ${it.declaredSize?.toString() ?: "unknown size"}" } +
                     "\n\nEach file requires a fresh receiver approval. 64 MiB maximum per file."
             else error

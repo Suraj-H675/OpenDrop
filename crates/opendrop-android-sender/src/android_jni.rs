@@ -299,8 +299,16 @@ impl AndroidPort {
         if output.is_null() {
             return Err(SendError::Protocol("no pending recovery"));
         }
-        env.convert_byte_array(JByteArray::from(output))
-            .map_err(|_| SendError::Protocol("JNI recovery bytes"))
+        let array = JByteArray::from(output);
+        let bytes = env
+            .convert_byte_array(&array)
+            .map_err(|_| SendError::Protocol("JNI recovery bytes"))?;
+        // JNI hands Rust a private copy. Wipe the decrypted Java byte array
+        // rather than leaving a second credential in heap memory until GC.
+        let zeros = vec![0i8; bytes.len()];
+        env.set_byte_array_region(&array, 0, &zeros)
+            .map_err(|_| SendError::Protocol("JNI recovery plaintext wipe failed"))?;
+        Ok(bytes)
     }
 
     fn finish_recovery(&self, id: &str) -> Result<()> {

@@ -44,16 +44,22 @@ internal class ProtectedReceiptStore(context: Context) {
     @Synchronized
     fun sealRecovery(id: String, expiresMs: Long, plaintext: ByteArray): Boolean {
         require(validId(id) && plaintext.size in 1..1024 && expiresMs > System.currentTimeMillis())
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, key())
-        cipher.updateAAD("$id:$expiresMs".toByteArray(Charsets.US_ASCII))
-        val ciphertext = cipher.doFinal(plaintext)
-        val wrapped = cipher.iv + ciphertext
-        return prefs.edit()
-            .putString("sealed:$id", Base64.encodeToString(wrapped, Base64.NO_WRAP))
-            .putLong("until:$id", expiresMs)
-            .putString("latest", id)
-            .commit()
+        try {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, key())
+            cipher.updateAAD("$id:$expiresMs".toByteArray(Charsets.US_ASCII))
+            val ciphertext = cipher.doFinal(plaintext)
+            val wrapped = cipher.iv + ciphertext
+            return prefs.edit()
+                .putString("sealed:$id", Base64.encodeToString(wrapped, Base64.NO_WRAP))
+                .putLong("until:$id", expiresMs)
+                .putString("latest", id)
+                .commit()
+        } finally {
+            // JNI's temporary Java-heap copy must not retain a second live
+            // plaintext credential after the AEAD operation or any failure.
+            plaintext.fill(0.toByte())
+        }
     }
 
     @Synchronized

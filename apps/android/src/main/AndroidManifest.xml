@@ -12,6 +12,12 @@
             android:name="org.opendrop.app.ShareIngressActivity"
             android:exported="true"
             android:theme="@android:style/Theme.Material.Light.NoActionBar">
+            <!-- A restart must allow the user to recover a lost Complete
+                 without manufacturing a new ACTION_SEND or reuploading. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />

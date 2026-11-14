@@ -16,7 +16,12 @@ import android.provider.MediaStore
  */
 internal class DownloadsDestination(private val resolver: ContentResolver) {
     fun createPending(name: String, mime: String): Uri {
-        require(Build.VERSION.SDK_INT >= 29) { "Requires scoped MediaStore downloads" }
+        // Android Lint and ART both need a real branch guarding API-29
+        // MediaStore.Downloads on our minSdk 26 build. Kotlin require()
+        // does not make later API calls statically safe.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            throw UnsupportedOperationException("Requires scoped MediaStore downloads")
+        }
         require(name.isNotBlank() && name.length <= 255 &&
             name != "." && name != ".." &&
             name.none { it == '/' || it == '\\' || Character.isISOControl(it) }) { "Unsafe file name" }
