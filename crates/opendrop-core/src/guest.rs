@@ -200,6 +200,11 @@ impl GuestHello {
     pub fn public_key(&self) -> &P256Spki {
         &self.spki
     }
+
+    /// Logical file role is distinct from this introduction's TCP/TLS side.
+    pub fn transfer_side(&self) -> TransferSide {
+        self.transfer_side
+    }
 }
 
 /// Canonical fixed-order context. Physical TLS roles and logical sender/

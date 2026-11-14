@@ -448,8 +448,14 @@ pub extern "C" fn opendrop_android_owner_confirm_sas(
             ],
         );
         match output {
-            Ok(value) if value.z().unwrap_or(false) => 1,
-            _ => {
+            Ok(value) => {
+                if value.z().unwrap_or(false) {
+                    1
+                } else {
+                    0
+                }
+            }
+            Err(_) => {
                 let _ = env.exception_clear();
                 0
             }

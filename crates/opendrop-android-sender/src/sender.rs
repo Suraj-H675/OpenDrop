@@ -233,7 +233,7 @@ pub fn connect_guest<T: Read + Write>(
     let receiver_spki = server.public_key().clone();
     let receiver_device = server.device_id().clone();
     let transcript = GuestTranscript::new(client, server)?;
-    if transcript.server().transfer_side != TransferSide::Receiver {
+    if transcript.server().transfer_side() != TransferSide::Receiver {
         return Err(SendError::Protocol("peer is not a file receiver"));
     }
     let config = guest_tls::client_config(identity, &transcript)?;
