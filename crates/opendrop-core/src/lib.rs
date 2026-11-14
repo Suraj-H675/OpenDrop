@@ -2,6 +2,9 @@
 //! contracts. No native consent issuer, app transport, or OS file adapter yet.
 
 pub mod authorization;
+pub mod guest;
+pub mod guest_recovery;
+pub mod guest_tls;
 pub mod identity;
 pub mod journal;
 pub mod policy;

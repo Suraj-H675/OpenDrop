@@ -12,6 +12,7 @@ linux-qt-consent = ["dep:rustix"]
 [dependencies]
 # Offline cached, mature SQLite API; review/update at a deliberate dependency gate.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
+ring = "=0.17.14"
 sha2 = "=0.10.9"
 rustls = { version = "=0.23.45", default-features = false, features = ["std", "ring"] }
 thiserror = "=2.0.21"
