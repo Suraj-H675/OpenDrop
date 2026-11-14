@@ -1064,4 +1064,271 @@ mod hosted_socket_tests {
     fn hosted_native_socket_guest_peer_first_lost_ack_recovers_without_republication() {
         run_transfer_and_recovery(true, true);
     }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Rejection {
+        TruncatedIntroduction,
+        WrongIntroductionRole,
+        WrongTlsSigningKey,
+        UnapprovedEarlyOffer,
+        WrongSasProof,
+        OwnerCancellation,
+        PrematureTlsDisconnect,
+        CorruptedFile,
+        DestinationCollision,
+    }
+
+    fn assert_native_rejection(case: Rejection) {
+        let (_temp, journal_path, destination, store) = temporary_owner_dirs();
+        let receiver = volatile_identity('b');
+        let sender = volatile_identity('a');
+        let mut admission = GuestAdmission::new_closed();
+        admission.open_for_hosted_guest_fixture();
+        let guest = Arc::new(GuestConfig {
+            identity: receiver,
+            admission: Arc::new(Mutex::new(admission)),
+            live: Arc::new(Mutex::new(None)),
+        });
+        let payload: Vec<u8> = (0..80_123).map(|n| (n % 251) as u8).collect();
+        let offered = offer(&sender, &payload);
+        let target = destination.join(&offered.file_offer().name);
+        if case == Rejection::DestinationCollision {
+            fs::write(&target, b"preserve the preexisting owner file").unwrap();
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let (ui_tx, ui_rx) = mpsc::sync_channel::<UiEvent>(4);
+        let (code_tx, code_rx) = mpsc::sync_channel::<String>(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let server_guest = guest.clone();
+        let server_journal = journal_path.clone();
+        let server_running = running.clone();
+        let server_ui = ui_tx.clone();
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let result = route_connection(
+                socket,
+                None,
+                Some(&server_guest),
+                &server_journal,
+                &server_ui,
+                &server_running,
+            );
+            result_tx.send(result.is_ok()).unwrap();
+        });
+        let ui_running = running.clone();
+        let ui_journal = journal_path.clone();
+        let ui = thread::spawn(move || {
+            while ui_running.load(Ordering::Acquire) {
+                match ui_rx.recv_timeout(Duration::from_millis(30)) {
+                    Ok(UiEvent::GuestSas(request)) => {
+                        let client_code = code_rx.recv_timeout(Duration::from_secs(4)).unwrap();
+                        assert_eq!(client_code, request.provisional.displayed_code());
+                        if case == Rejection::OwnerCancellation {
+                            let _ = request.result.send(None);
+                        } else {
+                            if case == Rejection::UnapprovedEarlyOffer {
+                                thread::sleep(Duration::from_millis(40));
+                            }
+                            let approval = request
+                                .provisional
+                                .approve_sas_for_hosted_guest_fixture()
+                                .ok();
+                            // The network can revoke the live flag before
+                            // the simulated click completes in the early-
+                            // data/disconnect rejection cases.
+                            let _ = request.result.send(approval);
+                        }
+                    }
+                    Ok(UiEvent::GuestOffer(request)) => {
+                        let mut journal = Journal::open(&ui_journal).unwrap();
+                        let result = ForegroundLinuxReceiver::after_hosted_guest_fixture_approval(
+                            request.verified,
+                            request.offer,
+                            &mut journal,
+                            store.clone(),
+                            request.active,
+                        )
+                        .unwrap();
+                        let _ = request.result.send(Some(result));
+                    }
+                    Ok(UiEvent::Status(_)) | Ok(UiEvent::Offer(_)) => {
+                        panic!("guest rejection must never enter paired owner UI");
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+        match case {
+            Rejection::TruncatedIntroduction => {
+                let mut socket = TcpStream::connect(addr).unwrap();
+                socket.write_all(b"ODGHtruncated").unwrap();
+            }
+            Rejection::WrongIntroductionRole => {
+                let mut socket = TcpStream::connect(addr).unwrap();
+                let wrong = sender
+                    .new_hello(TlsSide::Server, TransferSide::Sender)
+                    .unwrap();
+                socket.write_all(&wrong.encoded()).unwrap();
+            }
+            Rejection::WrongTlsSigningKey => {
+                let imposter = volatile_identity('c');
+                let mut socket = TcpStream::connect(addr).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let claimed = sender
+                    .new_hello(TlsSide::Client, TransferSide::Sender)
+                    .unwrap();
+                socket.write_all(&claimed.encoded()).unwrap();
+                let mut reply = [0u8; HELLO_LEN];
+                socket.read_exact(&mut reply).unwrap();
+                let actual_server = GuestHello::parse(&reply).unwrap();
+                let attacker_transcript = GuestTranscript::new(
+                    imposter
+                        .new_hello(TlsSide::Client, TransferSide::Sender)
+                        .unwrap(),
+                    actual_server,
+                )
+                .unwrap();
+                let config = guest_tls::client_config(&imposter, &attacker_transcript).unwrap();
+                let mut tls = ClientConnection::new(
+                    config,
+                    ServerName::try_from("opendrop.invalid").unwrap().to_owned(),
+                )
+                .unwrap();
+                // Both sides use REAL P-256 signing and exact-key verification.
+                // A signing key different from the announced SPKI must fail.
+                for _ in 0..16 {
+                    if tls.complete_io(&mut socket).is_err() || !tls.is_handshaking() {
+                        break;
+                    }
+                }
+            }
+            Rejection::UnapprovedEarlyOffer
+            | Rejection::WrongSasProof
+            | Rejection::OwnerCancellation
+            | Rejection::PrematureTlsDisconnect
+            | Rejection::CorruptedFile
+            | Rejection::DestinationCollision => {
+                let (mut tls, provisional) = guest_client(addr, &sender, None).unwrap();
+                code_tx
+                    .send(provisional.displayed_code().to_owned())
+                    .unwrap();
+                match case {
+                    Rejection::UnapprovedEarlyOffer => {
+                        Frame::Control(Control::Offer(offered.file_offer().clone()))
+                            .write_to(&mut tls)
+                            .unwrap();
+                        tls.flush().unwrap();
+                    }
+                    Rejection::WrongSasProof => {
+                        let accepted = provisional.approve_sas_for_hosted_guest_fixture().unwrap();
+                        let mut tampered = *accepted.outgoing_confirmation().unwrap().encoded();
+                        tampered[10] ^= 0x40;
+                        tls.write_all(&tampered).unwrap();
+                        tls.flush().unwrap();
+                        let mut legitimate_server_proof = [0u8; CONFIRM_LEN];
+                        let _ = tls.read_exact(&mut legitimate_server_proof);
+                    }
+                    Rejection::OwnerCancellation => {
+                        let mut response = [0u8; CONFIRM_LEN];
+                        assert!(tls.read_exact(&mut response).is_err());
+                    }
+                    Rejection::PrematureTlsDisconnect => {}
+                    Rejection::CorruptedFile | Rejection::DestinationCollision => {
+                        let _verified =
+                            authenticate_with_owner(&mut tls, provisional, false).unwrap();
+                        Frame::Control(Control::Offer(offered.file_offer().clone()))
+                            .write_to(&mut tls)
+                            .unwrap();
+                        tls.flush().unwrap();
+                        let _credential = ready(&mut tls, offered.file_offer());
+                        let mut transmitted = payload.clone();
+                        if case == Rejection::CorruptedFile {
+                            transmitted[0] ^= 0x80;
+                        }
+                        for chunk in transmitted.chunks(32 * 1024) {
+                            Frame::Data(chunk.to_vec()).write_to(&mut tls).unwrap();
+                        }
+                        Frame::Control(Control::End(offered.id().clone()))
+                            .write_to(&mut tls)
+                            .unwrap();
+                        tls.flush().unwrap();
+                        assert!(Frame::read_from(&mut tls).is_err());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        assert!(
+            !result_rx.recv_timeout(Duration::from_secs(12)).unwrap(),
+            "the production receiver accepted an unauthorized scenario: {case:?}"
+        );
+        server.join().unwrap();
+        running.store(false, Ordering::Release);
+        drop(ui_tx);
+        ui.join().unwrap();
+        if case == Rejection::DestinationCollision {
+            assert_eq!(
+                fs::read(&target).unwrap(),
+                b"preserve the preexisting owner file"
+            );
+        } else {
+            assert!(!target.exists(), "unexpected published file in {case:?}");
+        }
+        if journal_path.exists() {
+            let journal = rusqlite::Connection::open(&journal_path).unwrap();
+            let committed: i64 = journal
+                .query_row(
+                    "SELECT count(*) FROM transfers WHERE phase='committed'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(committed, 0, "unauthorized committed receipt in {case:?}");
+        }
+    }
+
+    #[test]
+    fn hosted_tcp_rejects_truncated_introduction() {
+        assert_native_rejection(Rejection::TruncatedIntroduction);
+    }
+    #[test]
+    fn hosted_tcp_rejects_wrong_introduction_role() {
+        assert_native_rejection(Rejection::WrongIntroductionRole);
+    }
+    #[test]
+    fn hosted_tls_rejects_wrong_signing_key() {
+        assert_native_rejection(Rejection::WrongTlsSigningKey);
+    }
+    #[test]
+    fn hosted_tls_rejects_unapproved_early_offer() {
+        assert_native_rejection(Rejection::UnapprovedEarlyOffer);
+    }
+    #[test]
+    fn hosted_tls_rejects_mismatched_sas_proof() {
+        assert_native_rejection(Rejection::WrongSasProof);
+    }
+    #[test]
+    fn hosted_tls_rejects_owner_sas_cancellation() {
+        assert_native_rejection(Rejection::OwnerCancellation);
+    }
+    #[test]
+    fn hosted_tcp_rejects_disconnect_before_owner_consent() {
+        assert_native_rejection(Rejection::PrematureTlsDisconnect);
+    }
+    #[test]
+    fn hosted_filesystem_rejects_corrupted_payload() {
+        assert_native_rejection(Rejection::CorruptedFile);
+    }
+    #[test]
+    fn hosted_filesystem_never_replaces_existing_destination() {
+        assert_native_rejection(Rejection::DestinationCollision);
+    }
 }
