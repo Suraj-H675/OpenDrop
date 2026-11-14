@@ -130,9 +130,12 @@ jobs:
           build_status=0
           gradle --no-daemon -p apps/android --write-verification-metadata sha256 assembleDebug lintDebug || build_status=$?
           if ! git diff --exit-code -- apps/android/gradle/verification-metadata.xml >/dev/null; then
-            echo 'S1D_GRADLE_PINS_BEGIN'
-            base64 -w0 apps/android/gradle/verification-metadata.xml
-            printf '\nS1D_GRADLE_PINS_END\n'
+            # GitHub Actions truncates a single huge base64 log line. Emit
+            # only the auditable new checksum hunks, then FAIL CLOSED until
+            # the exact SHA256 additions are reviewed and committed.
+            echo 'S1D_GRADLE_CHECKSUM_DIFF_BEGIN'
+            git diff --unified=3 -- apps/android/gradle/verification-metadata.xml | head -160
+            echo 'S1D_GRADLE_CHECKSUM_DIFF_END'
             exit 1
           fi
           if [ "$build_status" -ne 0 ]; then

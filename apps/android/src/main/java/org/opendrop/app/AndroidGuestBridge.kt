@@ -106,7 +106,7 @@ class AndroidGuestBridge(
                 // An absent/unspecified gateway is directly connected.
                 links.routes.any { route ->
                     route.matches(peer) && !route.isDefaultRoute &&
-                        (route.gateway == null || route.gateway.isAnyLocalAddress)
+                        (route.gateway?.isAnyLocalAddress != false)
                 }
         }
         require(available.size == 1) {

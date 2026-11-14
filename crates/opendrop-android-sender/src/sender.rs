@@ -25,6 +25,11 @@ use std::time::{Duration, Instant};
 const INTRO_LIMIT: Duration = Duration::from_secs(8);
 const FRAME_LIMIT: Duration = Duration::from_secs(8);
 const TRANSFER_LIMIT: Duration = Duration::from_secs(600);
+// The Linux owner has up to 125 seconds to accept an exact Offer after
+// bilateral SAS. Waiting only a normal 8-second wire-frame budget here
+// would cause a legitimate human-reviewed transfer to time out.
+const OFFER_CONSENT_LIMIT: Duration = Duration::from_secs(125);
+const COMPLETE_LIMIT: Duration = Duration::from_secs(45);
 const FILE_CHUNK: usize = 32 * 1024;
 const MAX_HANDSHAKE_ROUNDS: usize = 64;
 
@@ -114,10 +119,11 @@ fn write_control<T: Read + Write>(
 fn read_frame<T: Read + Write>(
     tls: &mut StreamOwned<ClientConnection, T>,
     active: &AtomicBool,
+    limit: Duration,
 ) -> Result<Frame> {
     Ok(Frame::read_from(&mut DeadlineIo {
         inner: tls,
-        deadline: deadline(FRAME_LIMIT)?,
+        deadline: deadline(limit)?,
         active,
     })?)
 }
@@ -377,7 +383,7 @@ impl<T: Read + Write> AuthenticatedSender<T> {
             Control::Offer(offered.file_offer().clone()),
             active,
         )?;
-        let credential = match read_frame(&mut self.tls, active)? {
+        let credential = match read_frame(&mut self.tls, active, OFFER_CONSENT_LIMIT)? {
             Frame::Control(Control::GuestReady(id, token)) if id == *offered.id() => token,
             Frame::Control(Control::Decline(_) | Control::Cancel(_) | Control::Failure(_)) => {
                 return Err(SendError::Rejected)
@@ -424,8 +430,8 @@ impl<T: Read + Write> AuthenticatedSender<T> {
             ));
         }
         write_control(&mut self.tls, Control::End(offered.id().clone()), active)?;
-        let reply =
-            read_frame(&mut self.tls, active).map_err(|_| SendError::UncertainCompletion)?;
+        let reply = read_frame(&mut self.tls, active, COMPLETE_LIMIT)
+            .map_err(|_| SendError::UncertainCompletion)?;
         match reply {
             Frame::Control(Control::Complete(receipt))
                 if self.verified.is_active()
