@@ -11,6 +11,38 @@ pub const MAX_CONTROL: usize = 8 * 1024;
 pub const MAX_CHUNK: usize = 64 * 1024;
 pub const MAX_FILE: u64 = 64 * 1024 * 1024;
 
+/// Guest recovery bytes travel only *inside* a freshly authenticated TLS
+/// stream. Debug output deliberately never prints the bearer credential.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WireRecoveryCredential([u8; 32]);
+
+impl std::fmt::Debug for WireRecoveryCredential {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt.write_str("WireRecoveryCredential([REDACTED])")
+    }
+}
+
+impl WireRecoveryCredential {
+    pub fn from_authenticated_bytes(bytes: [u8; 32]) -> Result<Self, Error> {
+        if bytes == [0; 32] {
+            return Err(Error::Unauthorized);
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl Drop for WireRecoveryCredential {
+    fn drop(&mut self) {
+        for byte in &mut self.0 {
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+    }
+}
+
 // Header: [version: u8, kind: u8, length: u32 big-endian].
 const DATA: u8 = 32;
 
@@ -26,6 +58,12 @@ pub enum Control {
     Complete(Receipt),
     ReceiptQuery(FileOffer),
     Failure(TransferId),
+    /// Sent only after bilateral SAS, independent exact-offer owner approval,
+    /// and durable reservation/verifier persistence. Not a trust grant.
+    GuestReady(TransferId, WireRecoveryCredential),
+    /// Only meaningful on the restricted fresh exact-key receipt-only TLS
+    /// reconnect. Never a request to stage, re-send or re-publish a file.
+    GuestReceiptQuery(FileOffer, WireRecoveryCredential),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +214,16 @@ impl Frame {
                     payload.extend_from_slice(id.as_str().as_bytes());
                     8
                 }
+                Control::GuestReady(id, token) => {
+                    payload.extend_from_slice(id.as_str().as_bytes());
+                    payload.extend_from_slice(token.as_bytes());
+                    9
+                }
+                Control::GuestReceiptQuery(offer, token) => {
+                    encode_offer(offer, &mut payload)?;
+                    payload.extend_from_slice(token.as_bytes());
+                    10
+                }
             },
         };
         if payload.is_empty() || (kind != DATA && payload.len() > MAX_CONTROL) {
@@ -194,7 +242,7 @@ impl Frame {
             return Err(Error::Invalid("wire version"));
         }
         let kind = header[1];
-        if kind != DATA && !(1..=8).contains(&kind) {
+        if kind != DATA && !(1..=10).contains(&kind) {
             return Err(Error::Invalid("wire kind"));
         }
         let len = u32::from_be_bytes(header[2..].try_into().unwrap()) as usize;
@@ -217,6 +265,22 @@ impl Frame {
             6 => Control::Complete(decode_receipt(&mut src)?),
             7 => Control::ReceiptQuery(decode_offer(&mut src)?),
             8 => Control::Failure(id(&mut src)?),
+            9 => Control::GuestReady(
+                id(&mut src)?,
+                WireRecoveryCredential::from_authenticated_bytes(
+                    take(&mut src, 32)?
+                        .try_into()
+                        .map_err(|_| Error::Invalid("guest credential length"))?,
+                )?,
+            ),
+            10 => Control::GuestReceiptQuery(
+                decode_offer(&mut src)?,
+                WireRecoveryCredential::from_authenticated_bytes(
+                    take(&mut src, 32)?
+                        .try_into()
+                        .map_err(|_| Error::Invalid("guest credential length"))?,
+                )?,
+            ),
             _ => return Err(Error::Invalid("wire kind")),
         };
         if !src.is_empty() {
@@ -248,6 +312,14 @@ mod tests {
             Frame::Control(Control::Offer(example())),
             Frame::Control(Control::ReceiptQuery(example())),
             Frame::Control(Control::Cancel(example().id)),
+            Frame::Control(Control::GuestReady(
+                example().id,
+                WireRecoveryCredential::from_authenticated_bytes([0x55; 32]).unwrap(),
+            )),
+            Frame::Control(Control::GuestReceiptQuery(
+                example(),
+                WireRecoveryCredential::from_authenticated_bytes([0xaa; 32]).unwrap(),
+            )),
             Frame::Data(vec![1, 2, 3]),
         ] {
             let mut stream = Vec::new();
@@ -257,6 +329,28 @@ mod tests {
                 original
             );
         }
+    }
+
+    #[test]
+    fn guest_recovery_wire_is_versioned_bounded_and_does_not_expose_secret_on_debug() {
+        let token = WireRecoveryCredential::from_authenticated_bytes([0xa5; 32]).unwrap();
+        assert_eq!(format!("{token:?}"), "WireRecoveryCredential([REDACTED])");
+        assert!(WireRecoveryCredential::from_authenticated_bytes([0; 32]).is_err());
+
+        let mut encoded = Vec::new();
+        Frame::Control(Control::GuestReady(example().id, token))
+            .write_to(&mut encoded)
+            .unwrap();
+        assert_eq!(&encoded[..2], &[VERSION, 9]);
+        assert_eq!(u32::from_be_bytes(encoded[2..6].try_into().unwrap()), 64);
+        assert!(Frame::read_from(&mut Cursor::new(&encoded[..encoded.len() - 1])).is_err());
+
+        let mut bad = encoded.clone();
+        bad[6 + 32..].fill(0);
+        assert!(Frame::read_from(&mut Cursor::new(&bad)).is_err());
+        bad = encoded;
+        bad[1] = 11;
+        assert!(Frame::read_from(&mut Cursor::new(&bad)).is_err());
     }
 
     #[test]

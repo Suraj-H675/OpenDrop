@@ -1,0 +1,70 @@
+name: S1-B Linux receiver Rust verification
+
+on:
+  push:
+    branches:
+      - verification/s1b-linux-20261113
+
+permissions:
+  contents: read
+
+jobs:
+  verify-s1b-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact pushed revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2; reviewed and used by S1-A
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Require S1-B branch and exact commit
+        shell: bash
+        run: |
+          test "$GITHUB_EVENT_NAME" = 'push'
+          test "$GITHUB_REF" = 'refs/heads/verification/s1b-linux-20261113'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          printf 'Verified GITHUB_SHA=%s\n' "$GITHUB_SHA"
+
+      - name: Set up runner-local Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Record hosted runner and Rust versions
+        shell: bash
+        run: |
+          cat /etc/os-release
+          rustc --version --verbose
+          cargo --version
+          rustfmt --version
+
+      - name: Install disposable runner Qt 6 and logind build headers
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends qt6-base-dev libsystemd-dev
+
+      - name: Verify Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Compile and test shared core and Linux receiver
+        run: cargo test -p opendrop-core -p opendrop-linux-receiver --locked
+
+      # A second isolated test compilation enables synthetic signers and
+      # owner actions only for the unit-test harness. The production executable
+      # is separately linked below WITHOUT this feature and has no fake signer.
+      - name: Exercise real guest TCP TLS filesystem and receipt-only loopback
+        run: cargo test -p opendrop-linux-receiver --bin opendrop-linux-receiver --features hosted-guest-fixture --locked
+
+      - name: Link the actual foreground Linux receiver executable
+        run: cargo build -p opendrop-linux-receiver --bin opendrop-linux-receiver --locked
+
+      - name: Compile and test native Qt owner dialog (headless synthetic)
+        shell: bash
+        run: |
+          cmake -S apps/linux/receiver/ui -B "$RUNNER_TEMP/opendrop-qt-owner" -DOPENDROP_BUILD_QT_TESTS=ON -DCMAKE_BUILD_TYPE=Debug
+          cmake --build "$RUNNER_TEMP/opendrop-qt-owner" --parallel 2
+          ctest --test-dir "$RUNNER_TEMP/opendrop-qt-owner" --output-on-failure

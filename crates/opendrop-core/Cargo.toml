@@ -4,12 +4,24 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+# Only the native Linux foreground application enables this. Headless/core
+# users (including Windows/Android consumers) have no Qt build dependency.
+linux-qt-consent = ["dep:rustix"]
+# Explicit CI-only native socket fixture gate. Never enabled by production
+# receiver builds; no runtime CLI can select its synthetic owner actions.
+hosted-guest-fixture = []
+
 [dependencies]
 # Offline cached, mature SQLite API; review/update at a deliberate dependency gate.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
+ring = "=0.17.14"
 sha2 = "=0.10.9"
 rustls = { version = "=0.23.45", default-features = false, features = ["std", "ring"] }
 thiserror = "=2.0.21"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "=1.1.4", features = ["time", "process", "fs"], optional = true }
 
 [dev-dependencies]
 tempfile = "=3.27.0"
