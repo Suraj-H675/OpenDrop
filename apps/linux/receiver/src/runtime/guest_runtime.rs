@@ -678,6 +678,13 @@ mod confirmation_order_tests {
 #[cfg(all(test, feature = "hosted-guest-fixture"))]
 mod hosted_socket_tests {
     use super::*;
+    use opendrop_android_sender::recovery::{
+        recover_committed as recover_android_guest_receipt, PendingRecovery,
+    };
+    use opendrop_android_sender::sender::{
+        connect_guest as connect_android_sender, prehash_source,
+        prepare_offer as prepare_android_offer,
+    };
     use opendrop_core::guest_tls::NativeP256Signer;
     use opendrop_core::identity::{DeviceId, Sha256Digest, TransferId};
     use opendrop_core::journal::{FileOffer, Receipt};
@@ -1063,6 +1070,154 @@ mod hosted_socket_tests {
     #[test]
     fn hosted_native_socket_guest_peer_first_lost_ack_recovers_without_republication() {
         run_transfer_and_recovery(true, true);
+    }
+
+    /// The product Android sender crate, not the preexisting S1-C custom
+    /// test client, connects to the real Linux receiver dispatcher. Only the
+    /// native platform ports (KeyStore and UI) are simulated in this fixture.
+    #[test]
+    fn hosted_android_sender_engine_reaches_native_linux_and_recovers_exact_receipt() {
+        let (_temp, journal_path, destination, store) = temporary_owner_dirs();
+        let receiver = volatile_identity('b');
+        let sender = volatile_identity('a');
+        let mut admission = GuestAdmission::new_closed();
+        admission.open_for_hosted_guest_fixture();
+        let guest = Arc::new(GuestConfig {
+            identity: receiver,
+            admission: Arc::new(Mutex::new(admission)),
+            live: Arc::new(Mutex::new(None)),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let (ui_tx, ui_rx) = mpsc::sync_channel::<UiEvent>(4);
+        let (code_tx, code_rx) = mpsc::sync_channel::<String>(1);
+        let (results_tx, results_rx) = mpsc::sync_channel(2);
+        let server_guest = guest.clone();
+        let server_running = running.clone();
+        let server_journal = journal_path.clone();
+        let server_ui = ui_tx.clone();
+        let server = thread::spawn(move || {
+            // Exactly one accepted ODGH followed by one read-only ODGR.
+            for _ in 0..2 {
+                let (socket, _) = listener.accept().unwrap();
+                let outcome = route_connection(
+                    socket,
+                    None,
+                    Some(&server_guest),
+                    &server_journal,
+                    &server_ui,
+                    &server_running,
+                );
+                results_tx.send(outcome.is_ok()).unwrap();
+            }
+        });
+        let ui_running = running.clone();
+        let ui_journal = journal_path.clone();
+        let ui = thread::spawn(move || {
+            while ui_running.load(Ordering::Acquire) {
+                match ui_rx.recv_timeout(Duration::from_millis(30)) {
+                    Ok(UiEvent::GuestSas(request)) => {
+                        let code = code_rx.recv_timeout(Duration::from_secs(4)).unwrap();
+                        assert_eq!(code, request.provisional.displayed_code());
+                        let approved = request
+                            .provisional
+                            .approve_sas_for_hosted_guest_fixture()
+                            .unwrap();
+                        request.result.send(Some(approved)).unwrap();
+                    }
+                    Ok(UiEvent::GuestOffer(request)) => {
+                        let mut journal = Journal::open(&ui_journal).unwrap();
+                        let approved =
+                            ForegroundLinuxReceiver::after_hosted_guest_fixture_approval(
+                                request.verified,
+                                request.offer,
+                                &mut journal,
+                                store.clone(),
+                                request.active,
+                            )
+                            .unwrap();
+                        request.result.send(Some(approved)).unwrap();
+                    }
+                    Ok(UiEvent::Status(_)) => {}
+                    Ok(UiEvent::Offer(_)) => panic!("guest entered the paired owner flow"),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+        let data: Vec<u8> = (0..144_003).map(|n| (n % 239) as u8).collect();
+        let (size, digest) = prehash_source(&mut io::Cursor::new(&data), None).unwrap();
+        let offered = prepare_android_offer(&sender, "android-to-linux.bin", size, digest).unwrap();
+        let socket = TcpStream::connect(addr).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let pairing =
+            connect_android_sender(socket, &sender, Arc::new(AtomicBool::new(true))).unwrap();
+        code_tx.send(pairing.displayed_code().to_owned()).unwrap();
+        let sender_session = pairing.confirm_for_hosted_fixture().unwrap();
+        let mut sealed = None;
+        let receipt = sender_session
+            .send_one(&offered, &mut io::Cursor::new(&data), |pending| {
+                sealed = Some(pending.encode_for_android_keystore()?);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(receipt.bytes, size);
+        assert_eq!(receipt.sha256, offered.file_offer().sha256);
+        assert!(results_rx.recv_timeout(Duration::from_secs(8)).unwrap());
+        assert_eq!(
+            fs::read(destination.join("android-to-linux.bin")).unwrap(),
+            data
+        );
+        let inode = fs::metadata(destination.join("android-to-linux.bin"))
+            .unwrap()
+            .ino();
+
+        // This test retains the exact pending record to exercise ODGR. The
+        // shipped Android port seals that record using Keystore AES-GCM;
+        // this hosted test does NOT impersonate Android's hardware security.
+        let pending = PendingRecovery::decode_from_android_keystore(&sealed.unwrap()).unwrap();
+        assert_eq!(pending.transfer_id(), offered.id());
+        let recovery_socket = TcpStream::connect(addr).unwrap();
+        recovery_socket
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        recovery_socket
+            .set_write_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let recovered = recover_android_guest_receipt(
+            recovery_socket,
+            &sender,
+            &pending,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap();
+        assert_eq!(recovered, receipt);
+        assert!(results_rx.recv_timeout(Duration::from_secs(8)).unwrap());
+        running.store(false, Ordering::Release);
+        server.join().unwrap();
+        drop(ui_tx);
+        ui.join().unwrap();
+        assert_eq!(
+            fs::metadata(destination.join("android-to-linux.bin"))
+                .unwrap()
+                .ino(),
+            inode
+        );
+        let journal = rusqlite::Connection::open(&journal_path).unwrap();
+        let committed: i64 = journal
+            .query_row(
+                "SELECT COUNT(*) FROM transfers WHERE phase='committed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(committed, 1);
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

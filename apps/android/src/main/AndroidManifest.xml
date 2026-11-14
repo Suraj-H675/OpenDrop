@@ -1,7 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- P1-A native entry only: no broad storage, network or foreground-service permission. -->
-    <application android:label="OpenDrop" android:allowBackup="false">
+    <!-- Network only: ContentResolver grants remain URI-scoped, no storage
+         runtime permission, no hotspot control or foreground service. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <application
+        android:label="OpenDrop"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="false">
         <activity
             android:name="org.opendrop.app.ShareIngressActivity"
             android:exported="true"

@@ -439,8 +439,12 @@ impl VerifiedReceiptOnlyTls {
         transcript: GuestTranscript,
         live: Arc<AtomicBool>,
     ) -> Result<Self, Error> {
-        if transcript.client().transfer_side != TransferSide::Receiver
-            || transcript.server().transfer_side != TransferSide::Sender
+        // TCP/TLS connector and logical file sender are independent roles.
+        // For today's Linux-receiver targeted ODGR exchange the Android TCP
+        // connector is the file SENDER. A future reverse-connection transport
+        // may invert TLS sides, but must retain the original logical roles.
+        if transcript.client().transfer_side != TransferSide::Sender
+            || transcript.server().transfer_side != TransferSide::Receiver
         {
             return Err(Error::Unauthorized);
         }
@@ -619,6 +623,37 @@ impl ProvisionalTlsPeer {
     /// must also close the TLS socket when it observes this revoked flag.
     pub fn abort_for_mismatch(self) {
         self.live.store(false, Ordering::Release);
+    }
+
+    /// Android's in-process Activity-owned confirmation bridge is the only
+    /// production Android issuer. The C ABI symbol is provided exclusively
+    /// by the Android JNI module, which dispatches to a visible, app-owned
+    /// dialog on the main thread and rejects lifecycle cancellation.
+    /// Neither network messages nor a public caller-provided bool can mint
+    /// this one-use local action.
+    #[cfg(target_os = "android")]
+    pub fn request_android_owner_sas(self) -> Result<AwaitingPeerConfirmation, Error> {
+        use std::ffi::CString;
+        extern "C" {
+            fn opendrop_android_owner_confirm_sas(
+                code: *const std::ffi::c_char,
+                fingerprint: *const std::ffi::c_char,
+            ) -> i32;
+        }
+        if !self.live.load(Ordering::Acquire) || self.deadline <= Instant::now() {
+            self.abort_for_mismatch();
+            return Err(Error::Unauthorized);
+        }
+        let code = CString::new(self.displayed_code()).map_err(|_| Error::Unauthorized)?;
+        let fingerprint = CString::new(self.peer_public_key().fingerprint().to_hex())
+            .map_err(|_| Error::Unauthorized)?;
+        let accepted =
+            unsafe { opendrop_android_owner_confirm_sas(code.as_ptr(), fingerprint.as_ptr()) };
+        if accepted != 1 {
+            self.abort_for_mismatch();
+            return Err(Error::Unauthorized);
+        }
+        self.accept_local_human_code(MatchedCodeOwnerAction { _private: () })
     }
 
     #[cfg(feature = "hosted-guest-fixture")]

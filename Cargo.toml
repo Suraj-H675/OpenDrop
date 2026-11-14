@@ -1,4 +1,4 @@
 [workspace]
-members = ["crates/opendrop-core", "apps/linux/receiver"]
+members = ["crates/opendrop-core", "crates/opendrop-android-sender", "apps/linux/receiver"]
 resolver = "2"
 

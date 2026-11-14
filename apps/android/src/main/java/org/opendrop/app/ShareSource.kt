@@ -5,12 +5,26 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.provider.OpenableColumns
+import java.io.ByteArrayInputStream
+import java.io.InputStream
 
-/** A one-file source granted by the sending app; never a filesystem path. */
-internal data class SharedFile(val uri: Uri, val name: String, val declaredSize: Long?)
+/** A single scoped URI, or a bounded explicit text share. Never a file path. */
+data class SharedFile(
+    val uri: Uri?,
+    val name: String,
+    val declaredSize: Long?,
+    val mime: String,
+    val inlineText: ByteArray? = null,
+)
 
-/** Uses only the explicit ACTION_SEND/ACTION_SEND_MULTIPLE URI grants. */
+/** Retain URI grants solely for the foreground Activity. Never assume a
+ * persistable grant, copy a complete file into RAM, or drop additional items.
+ */
 internal object ShareSource {
+    private const val MAX_ITEMS = 16
+    private const val MAX_BYTES = 64L * 1024L * 1024L
+    private const val MAX_TEXT = 64 * 1024
+
     fun parse(intent: Intent, resolver: ContentResolver): List<SharedFile> {
         val action = intent.action
         require(action == Intent.ACTION_SEND || action == Intent.ACTION_SEND_MULTIPLE) {
@@ -21,10 +35,18 @@ internal object ShareSource {
         } else {
             streams(intent)
         }
-        // The first production vertical slice is one file. No silent omission
-        // of additional items; the full Level 1 multi-file path is later.
-        require(uris.size == 1) { "Share one file in this early integration build" }
-        return uris.map { uri ->
+        if (uris.isEmpty() && action == Intent.ACTION_SEND) {
+            val text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
+                ?: error("The sending app did not provide an accessible file or text")
+            val bytes = text.toByteArray(Charsets.UTF_8)
+            require(bytes.isNotEmpty() && bytes.size <= MAX_TEXT) { "Text share is too large" }
+            return listOf(SharedFile(null, "Shared text.txt", bytes.size.toLong(), "text/plain", bytes))
+        }
+        require(uris.isNotEmpty() && uris.size <= MAX_ITEMS) {
+            "Select between 1 and 16 files"
+        }
+        require(uris.distinct().size == uris.size) { "Repeated share URI" }
+        return uris.mapIndexed { index, uri ->
             require(uri.scheme == ContentResolver.SCHEME_CONTENT && !uri.authority.isNullOrEmpty()) {
                 "Only explicitly granted content URIs are accepted"
             }
@@ -40,21 +62,29 @@ internal object ShareSource {
                     Pair(name, size)
                 }
             }
-            val name = details?.first ?: "Untitled file"
-            require(name.isNotBlank() && name.length <= 255 &&
-                name != "." && name != ".." &&
-                name.none { it == '/' || it == '\\' || Character.isISOControl(it) }) {
+            val name = details?.first ?: "Shared file ${index + 1}.bin"
+            require(name.isNotBlank() && name.toByteArray(Charsets.UTF_8).size <= 255 &&
+                name != "." && name != ".." && !name.startsWith(".") &&
+                !name.endsWith(" ") && !name.endsWith(".") &&
+                name.none { it == '/' || it == '\\' || it == ':' || Character.isISOControl(it) }) {
                 "Source provider returned an unsafe file name"
             }
-            val size = details?.second
-            require(size == null || size >= 0L) { "Invalid source-provider size" }
-            SharedFile(uri, name, size)
+            // SIZE is optional and some providers use -1 for unknown-length
+            // pipes. Prehash the bounded stream; never guess/truncate.
+            val size = details?.second?.takeIf { it >= 0L }
+            require(size == null || size <= MAX_BYTES) { "File exceeds 64 MiB" }
+            val mime = (resolver.getType(uri) ?: intent.type ?: "application/octet-stream")
+                .takeIf { it.length in 3..128 && !it.any(Char::isISOControl) }
+                ?: "application/octet-stream"
+            SharedFile(uri, name, size, mime)
         }
     }
 
     /** Reopen while the transient URI grant remains valid; never assume path access. */
-    fun openForRead(resolver: ContentResolver, source: SharedFile) =
-        resolver.openFileDescriptor(source.uri, "r") ?: error("Source provider denied read")
+    fun openForRead(resolver: ContentResolver, source: SharedFile): InputStream =
+        source.inlineText?.let { ByteArrayInputStream(it) }
+            ?: resolver.openInputStream(source.uri ?: error("Missing source URI"))
+            ?: error("Source provider denied read")
 
     @Suppress("DEPRECATION")
     private fun stream(intent: Intent): Uri? =

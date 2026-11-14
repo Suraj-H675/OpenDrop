@@ -23,4 +23,21 @@ android {
     kotlinOptions {
         jvmTarget = '17'
     }
+
+    sourceSets {
+        main {
+            // Native guest engine is built into an IGNORED generated folder
+            // by isolated Android CI, never checked in as a test library.
+            jniLibs.srcDirs = ['build/generated/opendrop-jni']
+        }
+    }
+}
+
+tasks.named('preBuild') {
+    doFirst {
+        def nativeLibrary = file('build/generated/opendrop-jni/arm64-v8a/libopendrop_android_guest.so')
+        if (!nativeLibrary.isFile() || nativeLibrary.length() < 1024L) {
+            throw new GradleException('Android guest app requires the real Rust arm64 JNI engine; no mock/software fallback')
+        }
+    }
 }

@@ -20,3 +20,4 @@ cryptoki = "=0.12.1"
 tempfile = "=3.27.0"
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 ring = "=0.17.14"
+opendrop-android-sender = { path = "../../../crates/opendrop-android-sender", features = ["hosted-guest-fixture"] }
