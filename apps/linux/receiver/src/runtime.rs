@@ -1,5 +1,7 @@
-//! Bounded one-peer-at-a-time foreground integration; no discovery,
-//! network pairing, daemon service, Android side, or automatic trust upgrade.
+//! Bounded one-peer-at-a-time foreground integration. Legacy paired mTLS and
+//! narrowly admitted guest-RPK TLS share ONE existing file-publication engine.
+//! There is no background daemon, broadcast discovery implementation,
+//! Android sender, automatic enrollment, or implicit trust upgrade.
 
 use opendrop_core::authorization::{request_linux_qt_guest_offer_consent, AuthenticatedSession};
 use opendrop_core::guest::{GuestAdmission, LinuxGuestVisibilityAction};
