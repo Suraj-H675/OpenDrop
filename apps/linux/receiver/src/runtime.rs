@@ -241,11 +241,16 @@ pub fn run() -> Result<(), &'static str> {
         .collect::<Result<Vec<_>, _>>()?;
     let Some(settings) = Settings::parse(args)? else {
         println!(
-            "OpenDrop Linux receiver (paired devices only)\n\
-             --listen IP:port --private-root ABS_PATH --destination ABS_PATH \\\n+             --tls-identity-root ABS_PATH\n\
-             Requires an independently provisioned 0700 identity folder with\n\
+            "OpenDrop Linux receiver (explicitly provisioned paired or guest mode)\n\
+             --listen IP:port --private-root ABS_PATH --destination ABS_PATH\n\
+             [--tls-identity-root ABS_PATH]\n\
+             [--guest-pkcs11-module ABS_PATH --guest-token-label LABEL\n\
+              --guest-key-label LABEL --guest-device-id 32_HEX]\n\
+             Legacy paired mode requires an independently provisioned 0700 identity folder with\n\
              server-cert.der, server-key.pkcs8.der, paired-client-root.der.\n\
-             No automatic enrollment, installation or trust provisioning."
+             Guest mode requires an independently provisioned hardware-token P-256 signing key\n\
+             with a protected authentication path. No software identity, automatic enrollment,\n\
+             installation or implicit trust provisioning is performed."
         );
         return Ok(());
     };
@@ -690,5 +695,36 @@ mod tests {
             "/c",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn guest_mode_requires_all_provisioning_fields_and_never_infers_identity() {
+        let base = [
+            "--listen",
+            "127.0.0.1:43991",
+            "--private-root",
+            "/some-owner-private-directory",
+            "--destination",
+            "/some-owner-destination-directory",
+        ];
+        assert!(args(&base).is_err());
+        let mut partial = base.to_vec();
+        partial.extend(["--guest-pkcs11-module", "/usr/lib/pkcs11/module.so"]);
+        assert!(args(&partial).is_err());
+        let test_device = "f".repeat(32);
+        partial.extend([
+            "--guest-token-label",
+            "OpenDrop Token",
+            "--guest-key-label",
+            "OpenDrop Installation",
+            "--guest-device-id",
+            test_device.as_str(),
+        ]);
+        let configured = args(&partial).unwrap().unwrap();
+        assert!(configured.tls_identity_root.is_none());
+        assert_eq!(configured.guest.unwrap().device_id.as_str(), "f".repeat(32));
+        let last = partial.len() - 1;
+        partial[last] = "peer-provided-ID";
+        assert!(args(&partial).is_err());
     }
 }

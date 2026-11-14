@@ -312,6 +312,14 @@ mod tests {
             Frame::Control(Control::Offer(example())),
             Frame::Control(Control::ReceiptQuery(example())),
             Frame::Control(Control::Cancel(example().id)),
+            Frame::Control(Control::GuestReady(
+                example().id,
+                WireRecoveryCredential::from_authenticated_bytes([0x55; 32]).unwrap(),
+            )),
+            Frame::Control(Control::GuestReceiptQuery(
+                example(),
+                WireRecoveryCredential::from_authenticated_bytes([0xaa; 32]).unwrap(),
+            )),
             Frame::Data(vec![1, 2, 3]),
         ] {
             let mut stream = Vec::new();
@@ -321,6 +329,28 @@ mod tests {
                 original
             );
         }
+    }
+
+    #[test]
+    fn guest_recovery_wire_is_versioned_bounded_and_does_not_expose_secret_on_debug() {
+        let token = WireRecoveryCredential::from_authenticated_bytes([0xa5; 32]).unwrap();
+        assert_eq!(format!("{token:?}"), "WireRecoveryCredential([REDACTED])");
+        assert!(WireRecoveryCredential::from_authenticated_bytes([0; 32]).is_err());
+
+        let mut encoded = Vec::new();
+        Frame::Control(Control::GuestReady(example().id, token))
+            .write_to(&mut encoded)
+            .unwrap();
+        assert_eq!(&encoded[..2], &[VERSION, 9]);
+        assert_eq!(u32::from_be_bytes(encoded[2..6].try_into().unwrap()), 64);
+        assert!(Frame::read_from(&mut Cursor::new(&encoded[..encoded.len() - 1])).is_err());
+
+        let mut bad = encoded.clone();
+        bad[6 + 32..].fill(0);
+        assert!(Frame::read_from(&mut Cursor::new(&bad)).is_err());
+        bad = encoded;
+        bad[1] = 11;
+        assert!(Frame::read_from(&mut Cursor::new(&bad)).is_err());
     }
 
     #[test]

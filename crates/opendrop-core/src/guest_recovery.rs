@@ -435,6 +435,37 @@ mod tests {
     }
 
     #[test]
+    fn guest_offer_requires_the_exact_authenticated_sender_spki() {
+        let scope = test_scope();
+        let original = scope.offer.file_offer().clone();
+        let exact = GuestOfferV1::from_verified_wire_offer(
+            original.clone(),
+            scope.sender_spki.fingerprint(),
+        )
+        .unwrap();
+        assert_eq!(exact.file_offer(), &original);
+        assert_eq!(exact.canonical_digest(), scope.offer_digest);
+        assert!(GuestOfferV1::from_verified_wire_offer(
+            original.clone(),
+            test_spki(7).fingerprint(),
+        )
+        .is_err());
+        let mut substituted = original.clone();
+        substituted.sha256 = Sha256Digest::parse(&"d".repeat(64)).unwrap();
+        let altered =
+            GuestOfferV1::from_verified_wire_offer(substituted, scope.sender_spki.fingerprint())
+                .unwrap();
+        assert_ne!(altered.canonical_digest(), scope.offer_digest);
+
+        let mut malformed = original;
+        malformed.name = "../overwrite".to_string();
+        assert!(
+            GuestOfferV1::from_verified_wire_offer(malformed, scope.sender_spki.fingerprint(),)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn bearer_credential_is_random_nonzero_and_never_prints_secret_bytes() {
         let first = GuestRecoveryCredential::generate().unwrap();
         let second = GuestRecoveryCredential::generate().unwrap();

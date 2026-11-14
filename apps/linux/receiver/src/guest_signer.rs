@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::Arc;
 use std::thread;
@@ -75,15 +75,25 @@ pub fn open_preprovisioned(
         || token_label.len() > 32
         || key_label.len() > 128
         || !module.is_absolute()
+        || module
+            .components()
+            .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
     {
         return Err(Error::Unauthorized);
     }
-    let metadata = fs::symlink_metadata(module)?;
-    if !metadata.is_file()
-        || metadata.mode() & 0o022 != 0
-        || (metadata.uid() != 0 && metadata.uid() != rustix::process::geteuid().as_raw())
-    {
-        return Err(Error::Unauthorized);
+    // Loading a replaceable PKCS#11 plugin exposes every signing request to
+    // arbitrary code. Require a root-owned immutable-by-nonroot path,
+    // including ALL ancestors. Software-token flags are still not hardware
+    // attestation, and a privileged root adversary is out of scope.
+    for ancestor in module.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)?;
+        if metadata.uid() != 0
+            || metadata.mode() & 0o022 != 0
+            || (ancestor == module && !metadata.is_file())
+            || (ancestor != module && !metadata.is_dir())
+        {
+            return Err(Error::Unauthorized);
+        }
     }
     let module = PathBuf::from(module);
     let token_label = token_label.to_owned();
@@ -262,5 +272,15 @@ mod tests {
             vec![0x30, 0x07, 0x02, 0x01, 0x01, 0x02, 0x02, 0x00, 0x80]
         );
         assert!(raw_ecdsa_to_der(&input[..63]).is_err());
+    }
+
+    #[test]
+    fn signer_refuses_relative_modules_and_implicit_token_defaults() {
+        assert!(open_preprovisioned(Path::new("module.so"), "token", "key").is_err());
+        assert!(open_preprovisioned(Path::new("/usr/lib/module.so"), "", "key").is_err());
+        assert!(open_preprovisioned(Path::new("/usr/lib/module.so"), "token", "").is_err());
+        assert!(
+            open_preprovisioned(Path::new("/usr/lib/../lib/module.so"), "token", "key").is_err()
+        );
     }
 }
