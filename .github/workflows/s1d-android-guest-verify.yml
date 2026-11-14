@@ -121,7 +121,19 @@ jobs:
           cp "$library" apps/android/build/generated/opendrop-jni/arm64-v8a/libopendrop_android_guest.so
           file "$library"
       - name: Compile APK and static lint; never install
-        run: gradle --no-daemon -p apps/android assembleDebug lintDebug
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Only runner-local bootstrap for previously unlisted Maven
+          # metadata: emit exact SHA256 pins for review; NEVER bypass
+          # verification in the accepted S1-D gate.
+          gradle --no-daemon -p apps/android --write-verification-metadata sha256 assembleDebug lintDebug
+          if ! git diff --exit-code -- apps/android/gradle/verification-metadata.xml >/dev/null; then
+            echo 'S1D_GRADLE_PINS_BEGIN'
+            base64 -w0 apps/android/gradle/verification-metadata.xml
+            printf '\nS1D_GRADLE_PINS_END\n'
+            exit 1
+          fi
       - name: Verify APK contains actual ARM64 guest engine
         shell: bash
         run: |
