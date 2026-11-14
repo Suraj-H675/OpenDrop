@@ -297,6 +297,7 @@ fn serve_guest(
         started: Instant::now(),
         limit: FRAME_LIMIT,
         running,
+        session_active: Some(transport.live.as_ref()),
     }
     .read_exact(&mut peer_proof)
     .map_err(|_| "guest confirmation not received")?;
@@ -308,7 +309,12 @@ fn serve_guest(
     if !verified.is_active() {
         return Err("guest admission revoked");
     }
-    let offer = match super::read_with_deadline(&mut tls, OFFER_LIMIT, running)? {
+    let offer = match super::read_with_deadline(
+        &mut tls,
+        OFFER_LIMIT,
+        running,
+        Some(transport.live.as_ref()),
+    )? {
         Frame::Control(Control::Offer(offer)) => {
             GuestOfferV1::from_verified_wire_offer(offer, verified.logical_sender_spki())
                 .map_err(|_| "guest offer sender/key mismatch")?
@@ -390,7 +396,12 @@ fn serve_recovery(
     )
     .map_err(|_| "unverified guest recovery TLS")?;
     let mut tls = StreamOwned::new(connection, socket);
-    match super::read_with_deadline(&mut tls, FRAME_LIMIT, running)? {
+    match super::read_with_deadline(
+        &mut tls,
+        FRAME_LIMIT,
+        running,
+        Some(transport.live.as_ref()),
+    )? {
         Frame::Control(Control::GuestReceiptQuery(offer, credential))
             if &offer == scope.file_offer() =>
         {

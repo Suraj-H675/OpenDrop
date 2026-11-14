@@ -45,14 +45,19 @@ struct FrameDeadlineReader<'a, R: Read> {
     started: Instant,
     limit: Duration,
     running: &'a AtomicBool,
+    session_active: Option<&'a AtomicBool>,
 }
 impl<R: Read> Read for FrameDeadlineReader<'_, R> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         loop {
-            if !self.running.load(Ordering::Acquire) {
+            if !self.running.load(Ordering::Acquire)
+                || self
+                    .session_active
+                    .is_some_and(|session| !session.load(Ordering::Acquire))
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "receiver stopping",
+                    "receiver stopping or guest session revoked",
                 ));
             }
             if self.started.elapsed() >= self.limit {
@@ -517,7 +522,7 @@ fn serve_one(
     let authenticated = AuthenticatedSession::from_paired_tls_server(&connection, &journal)
         .map_err(|_| "unpaired or revoked client certificate")?;
     let mut tls = StreamOwned::new(connection, socket);
-    let first = read_with_deadline(&mut tls, OFFER_LIMIT, running)?;
+    let first = read_with_deadline(&mut tls, OFFER_LIMIT, running, None)?;
     match first {
         Frame::Control(Control::ReceiptQuery(offer)) => {
             if let Some(receipt) = authenticated
@@ -585,12 +590,14 @@ fn read_with_deadline(
     tls: &mut TlsTransport,
     limit: Duration,
     running: &AtomicBool,
+    session_active: Option<&AtomicBool>,
 ) -> Result<Frame, &'static str> {
     Frame::read_from(&mut FrameDeadlineReader {
         input: tls,
         started: Instant::now(),
         limit,
         running,
+        session_active,
     })
     .map_err(|_| "invalid, truncated or timed-out wire frame")
 }
@@ -598,7 +605,7 @@ fn read_with_deadline(
 fn receive_verified_stream(
     mut tls: TlsTransport,
     mut receiver: ForegroundLinuxReceiver,
-    _transport_owner: SessionCancellation,
+    transport_owner: SessionCancellation,
     mut journal: Journal,
     running: &AtomicBool,
     guest_ready: Option<WireRecoveryCredential>,
@@ -619,7 +626,12 @@ fn receive_verified_stream(
         if !running.load(Ordering::Acquire) || started.elapsed() >= STREAM_LIMIT {
             return Err("transfer timed out or owner closed receiver");
         }
-        let frame = read_with_deadline(&mut tls, FRAME_LIMIT, running)?;
+        let frame = read_with_deadline(
+            &mut tls,
+            FRAME_LIMIT,
+            running,
+            Some(transport_owner.active_flag()),
+        )?;
         receiver
             .receive_frame(frame)
             .map_err(|_| "transfer content rejected")?;
@@ -648,6 +660,7 @@ fn receive_verified_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn args(rest: &[&str]) -> Result<Option<Settings>, &'static str> {
         Settings::parse(rest.iter().map(|value| (*value).to_owned()))
@@ -728,5 +741,34 @@ mod tests {
         let last = partial.len() - 1;
         partial[last] = "peer-provided-ID";
         assert!(args(&partial).is_err());
+    }
+
+    #[test]
+    fn revoked_guest_frame_reader_rejects_bytes_before_dispatch_or_stage() {
+        let mut encoded = Cursor::new(vec![1u8, 32, 0, 0, 0, 1, 0x7f]);
+        let running = AtomicBool::new(true);
+        let guest_active = AtomicBool::new(false);
+        let mut reader = FrameDeadlineReader {
+            input: &mut encoded,
+            started: Instant::now(),
+            limit: FRAME_LIMIT,
+            running: &running,
+            session_active: Some(&guest_active),
+        };
+        let mut output = [0u8; 1];
+        assert_eq!(
+            reader.read(&mut output).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(encoded.position(), 0);
+        let mut normal = Cursor::new(vec![1u8]);
+        let mut paired_reader = FrameDeadlineReader {
+            input: &mut normal,
+            started: Instant::now(),
+            limit: FRAME_LIMIT,
+            running: &running,
+            session_active: None,
+        };
+        assert_eq!(paired_reader.read(&mut output).unwrap(), 1);
     }
 }

@@ -40,6 +40,14 @@ pub struct SessionCancellation {
 }
 
 impl SessionCancellation {
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub fn active_flag(&self) -> &AtomicBool {
+        &self.active
+    }
+
     /// Borrow the live flag of an already established guest RPK transport.
     /// This can only revoke a session; it cannot mint any consent capability.
     pub fn from_transport_flag(active: Arc<AtomicBool>) -> Self {
