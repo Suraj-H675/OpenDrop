@@ -1,10 +1,13 @@
 //! Bounded one-peer-at-a-time foreground integration; no discovery,
 //! network pairing, daemon service, Android side, or automatic trust upgrade.
 
-use opendrop_core::authorization::AuthenticatedSession;
+use opendrop_core::authorization::{request_linux_qt_guest_offer_consent, AuthenticatedSession};
+use opendrop_core::guest::{GuestAdmission, LinuxGuestVisibilityAction};
+use opendrop_core::guest_tls::LocalGuestIdentity;
+use opendrop_core::identity::DeviceId;
 use opendrop_core::journal::{FileOffer, Journal};
 use opendrop_core::receiver::ReceiveState;
-use opendrop_core::wire::{Control, Frame};
+use opendrop_core::wire::{Control, Frame, WireRecoveryCredential};
 use opendrop_linux_receiver::storage::LinuxReceiverStorage;
 use opendrop_linux_receiver::tls::load_provisioned_tls;
 use opendrop_linux_receiver::{ForegroundLinuxReceiver, SessionCancellation};
@@ -15,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, SyncSender, TryRecvError},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,6 +32,8 @@ const IO_TICK: Duration = Duration::from_millis(250);
 const MAX_TRANSFER_FRAMES: usize = 131_072;
 
 type TlsTransport = StreamOwned<ServerConnection, TcpStream>;
+mod guest_runtime;
+use guest_runtime::{GuestConfig, GuestOfferRequest, GuestSasRequest};
 
 /// Per-frame budget independent of fragmented reads, temporary OS socket
 /// timeouts or peer-controlled chunk boundaries. The underlying socket has
@@ -72,6 +77,7 @@ extern "C" {
     fn opendrop_qt_foreground_poll();
     fn opendrop_qt_foreground_status(message: *const std::ffi::c_char);
     fn opendrop_qt_foreground_shutdown();
+    fn opendrop_qt_guest_visibility_available(available: i32);
 }
 
 fn display(message: &'static [u8]) {
@@ -94,6 +100,9 @@ impl QtForeground {
         let stop_requested = unsafe { opendrop_qt_foreground_stop_requested() };
         stop_requested == 0
     }
+    fn guest_available(&self, available: bool) {
+        unsafe { opendrop_qt_guest_visibility_available(i32::from(available)) };
+    }
 }
 impl Drop for QtForeground {
     fn drop(&mut self) {
@@ -106,7 +115,16 @@ struct Settings {
     listen: SocketAddr,
     private_root: PathBuf,
     default_destination: PathBuf,
-    tls_identity_root: PathBuf,
+    tls_identity_root: Option<PathBuf>,
+    guest: Option<GuestKeySettings>,
+}
+
+#[derive(Debug)]
+struct GuestKeySettings {
+    module: PathBuf,
+    token_label: String,
+    key_label: String,
+    device_id: DeviceId,
 }
 
 impl Settings {
@@ -116,6 +134,10 @@ impl Settings {
         let mut private_root = None;
         let mut default_destination = None;
         let mut tls_identity_root = None;
+        let mut guest_module = None;
+        let mut guest_token_label = None;
+        let mut guest_key_label = None;
+        let mut guest_device_id = None;
         while let Some(key) = arguments.next() {
             if key == "--help" {
                 return Ok(None);
@@ -126,6 +148,10 @@ impl Settings {
                 "--private-root" => &mut private_root,
                 "--destination" => &mut default_destination,
                 "--tls-identity-root" => &mut tls_identity_root,
+                "--guest-pkcs11-module" => &mut guest_module,
+                "--guest-token-label" => &mut guest_token_label,
+                "--guest-key-label" => &mut guest_key_label,
+                "--guest-device-id" => &mut guest_device_id,
                 _ => return Err("Unknown receiver option."),
             };
             if field.replace(value).is_some() {
@@ -142,11 +168,41 @@ impl Settings {
         let private_root = PathBuf::from(private_root.ok_or("Missing private root.")?);
         let default_destination =
             PathBuf::from(default_destination.ok_or("Missing owner destination.")?);
-        let tls_identity_root =
-            PathBuf::from(tls_identity_root.ok_or("Missing provisioned TLS identity root.")?);
-        if [&private_root, &default_destination, &tls_identity_root]
+        let provided_guest = [
+            guest_module.is_some(),
+            guest_token_label.is_some(),
+            guest_key_label.is_some(),
+            guest_device_id.is_some(),
+        ];
+        if provided_guest.iter().any(|provided| *provided)
+            && !provided_guest.iter().all(|provided| *provided)
+        {
+            return Err("Guest hardware key configuration must be complete.");
+        }
+        let guest = if provided_guest.iter().all(|provided| *provided) {
+            Some(GuestKeySettings {
+                module: PathBuf::from(guest_module.ok_or("Missing hardware module.")?),
+                token_label: guest_token_label.ok_or("Missing token label.")?,
+                key_label: guest_key_label.ok_or("Missing signing key label.")?,
+                device_id: DeviceId::parse(
+                    &guest_device_id.ok_or("Missing guest installation ID.")?,
+                )
+                .map_err(|_| "Invalid canonical guest installation ID.")?,
+            })
+        } else {
+            None
+        };
+        if guest.is_none() && tls_identity_root.is_none() {
+            return Err("No provisioned paired identity or guest hardware key.");
+        }
+        let tls_identity_root = tls_identity_root.map(PathBuf::from);
+        if [&private_root, &default_destination]
             .iter()
             .any(|path| !path.is_absolute())
+            || tls_identity_root
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute())
+            || guest.as_ref().is_some_and(|key| !key.module.is_absolute())
         {
             return Err("Only absolute owner-controlled directories are allowed.");
         }
@@ -155,6 +211,7 @@ impl Settings {
             private_root,
             default_destination,
             tls_identity_root,
+            guest,
         }))
     }
 }
@@ -168,6 +225,8 @@ struct OwnerRequest {
 
 enum UiEvent {
     Offer(OwnerRequest),
+    GuestSas(GuestSasRequest),
+    GuestOffer(GuestOfferRequest),
     Status(&'static [u8]),
 }
 
@@ -192,8 +251,30 @@ pub fn run() -> Result<(), &'static str> {
     };
     // Load all private credentials BEFORE opening any socket. No fabricated
     // identity or client trust root is installed on missing configuration.
-    let config = load_provisioned_tls(&settings.tls_identity_root)
+    let config = settings
+        .tls_identity_root
+        .as_ref()
+        .map(|root| load_provisioned_tls(root))
+        .transpose()
         .map_err(|_| "No valid provisioned TLS identity and client trust root. Not listening.")?;
+    let guest = settings
+        .guest
+        .map(|key| {
+            let signer = crate::guest_signer::open_preprovisioned(
+                &key.module,
+                &key.token_label,
+                &key.key_label,
+            )
+            .map_err(|_| "Guest hardware token is absent, locked or unsafe. Not listening.")?;
+            let identity = LocalGuestIdentity::from_platform_signer(key.device_id, signer)
+                .map_err(|_| "Guest hardware P-256 identity failed signing-key verification.")?;
+            Ok::<_, &'static str>(Arc::new(GuestConfig {
+                identity: Arc::new(identity),
+                admission: Arc::new(Mutex::new(GuestAdmission::new_closed())),
+                live: Arc::new(Mutex::new(None)),
+            }))
+        })
+        .transpose()?;
     let storage =
         LinuxReceiverStorage::open_private(&settings.private_root, &settings.default_destination)
             .map_err(|_| "Private staging or owner destination directory is unsafe.")?;
@@ -206,6 +287,7 @@ pub fn run() -> Result<(), &'static str> {
     // Uncertain CommitIntent and unidentified inventory remain untouched.
     // Never auto-republish, fabricate a receipt or silently delete them.
     let foreground = QtForeground::start()?;
+    foreground.guest_available(guest.is_some());
     if recovery.preserved_unresolved_intent != 0
         || recovery.preserved_unverifiable_destination != 0
         || recovery.unidentified_private_entries != 0
@@ -220,24 +302,92 @@ pub fn run() -> Result<(), &'static str> {
     let running = Arc::new(AtomicBool::new(true));
     let (events_tx, events_rx) = mpsc::sync_channel::<UiEvent>(4);
     let worker_live = running.clone();
+    let worker_guest = guest.clone();
     let worker = thread::spawn(move || {
-        accept_single_peer(listener, config, journal_path, events_tx, worker_live)
+        accept_single_peer(
+            listener,
+            config,
+            worker_guest,
+            journal_path,
+            events_tx,
+            worker_live,
+        )
     });
+    let mut was_guest_visible = false;
     while foreground.poll() {
+        if let Some(guest) = guest.as_ref() {
+            let mut admission = guest
+                .admission
+                .lock()
+                .map_err(|_| "Guest admission policy unavailable.")?;
+            match admission.poll_linux_qt_owner_action() {
+                Ok(LinuxGuestVisibilityAction::Revoked) | Err(_) => {
+                    admission.revoke_from_owner();
+                    if let Ok(slot) = guest.live.lock() {
+                        if let Some(active) = slot.as_ref() {
+                            active.store(false, Ordering::Release);
+                        }
+                    }
+                }
+                Ok(LinuxGuestVisibilityAction::None | LinuxGuestVisibilityAction::Opened) => {}
+            }
+            let visible = !admission.remaining_visibility().is_zero();
+            if visible && !was_guest_visible {
+                display(b"Guest requests visible for ten minutes. Every file needs approval.\0");
+            } else if !visible && was_guest_visible {
+                display(b"Guest visibility ended. New guest requests are blocked.\0");
+            }
+            was_guest_visible = visible;
+        }
         match events_rx.recv_timeout(Duration::from_millis(35)) {
             Ok(UiEvent::Status(text)) => display(text),
             Ok(UiEvent::Offer(request)) => {
                 owner_approval(request, &mut journal, &storage, &running);
+            }
+            Ok(UiEvent::GuestSas(request)) => {
+                let _ = request
+                    .result
+                    .send(request.provisional.request_linux_qt_sas().ok());
+            }
+            Ok(UiEvent::GuestOffer(request)) => {
+                guest_owner_approval(request, &mut journal, &storage);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     running.store(false, Ordering::Release);
+    if let Some(guest) = guest {
+        if let Ok(mut admission) = guest.admission.lock() {
+            admission.revoke_from_owner();
+        }
+    }
     worker
         .join()
         .map_err(|_| "Receiver worker stopped unexpectedly.")?;
     Ok(())
+}
+
+fn guest_owner_approval(
+    request: GuestOfferRequest,
+    journal: &mut Journal,
+    storage: &LinuxReceiverStorage,
+) {
+    let result = request_linux_qt_guest_offer_consent(
+        request.verified,
+        request.offer,
+        storage.owner_destination_display(),
+        &request.active,
+    )
+    .and_then(|grant| {
+        ForegroundLinuxReceiver::after_guest_owner_approval(
+            grant,
+            journal,
+            storage.clone(),
+            request.active.clone(),
+        )
+    });
+    let _ = request.result.send(result.ok());
 }
 
 fn owner_approval(
@@ -279,7 +429,8 @@ fn owner_approval(
 
 fn accept_single_peer(
     listener: TcpListener,
-    config: Arc<rustls::ServerConfig>,
+    config: Option<Arc<rustls::ServerConfig>>,
+    guest: Option<Arc<GuestConfig>>,
     journal_path: PathBuf,
     ui: SyncSender<UiEvent>,
     running: Arc<AtomicBool>,
@@ -292,7 +443,14 @@ fn accept_single_peer(
             Ok((socket, _address)) => {
                 // One worker and one session; there is no transfer parallelism
                 // or per-client allocation outside the bounded TLS state.
-                let outcome = serve_one(socket, config.clone(), &journal_path, &ui, &running);
+                let outcome = guest_runtime::route_connection(
+                    socket,
+                    config.clone(),
+                    guest.as_ref(),
+                    &journal_path,
+                    &ui,
+                    &running,
+                );
                 if outcome.is_err() {
                     let _ = ui.try_send(UiEvent::Status(
                         b"Connection closed or transfer could not be completed safely.\0",
@@ -410,7 +568,7 @@ fn serve_one(
             };
             // This guard remains owned by the actual transport thread through
             // successful commit or any error. It revokes itself on Drop.
-            return receive_verified_stream(tls, receiver, cancellation, journal, running);
+            return receive_verified_stream(tls, receiver, cancellation, journal, running, None);
         }
         _ => Err("only an Offer or exact ReceiptQuery is permitted"),
     }
@@ -436,11 +594,16 @@ fn receive_verified_stream(
     _transport_owner: SessionCancellation,
     mut journal: Journal,
     running: &AtomicBool,
+    guest_ready: Option<WireRecoveryCredential>,
 ) -> Result<(), &'static str> {
     receiver
         .start_staging()
         .map_err(|_| "cannot create private stage")?;
-    Frame::Control(Control::Ready(receiver.pending_offer().id.clone()))
+    let ready = match guest_ready {
+        Some(token) => Control::GuestReady(receiver.pending_offer().id.clone(), token),
+        None => Control::Ready(receiver.pending_offer().id.clone()),
+    };
+    Frame::Control(ready)
         .write_to(&mut tls)
         .map_err(|_| "send Ready")?;
     tls.flush().map_err(|_| "flush Ready")?;

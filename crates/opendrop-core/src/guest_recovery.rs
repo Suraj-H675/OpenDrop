@@ -36,6 +36,31 @@ pub struct GuestOfferV1 {
 }
 
 impl GuestOfferV1 {
+    /// Construct only from a bounded, decoded wire Offer after the same TLS
+    /// channel has reached VerifiedGuestSession. A guest SPKI value never
+    /// upgrades the legacy paired-certificate trust domain.
+    pub fn from_verified_wire_offer(
+        offered: FileOffer,
+        actual_sender: GuestSpkiFingerprint,
+    ) -> Result<Self, Error> {
+        crate::wire::validate_offer(&offered)?;
+        if offered.peer.as_str() != actual_sender.to_hex() {
+            return Err(Error::Unauthorized);
+        }
+        let original = Self::new(
+            offered.id.clone(),
+            actual_sender,
+            offered.manifest.clone(),
+            offered.name.clone(),
+            offered.bytes,
+            offered.sha256.clone(),
+        )?;
+        if original.transfer != offered {
+            return Err(Error::Unauthorized);
+        }
+        Ok(original)
+    }
+
     pub fn new(
         id: TransferId,
         sender: GuestSpkiFingerprint,
@@ -65,6 +90,10 @@ impl GuestOfferV1 {
 
     pub fn sender(&self) -> GuestSpkiFingerprint {
         self.sender
+    }
+
+    pub fn file_offer(&self) -> &FileOffer {
+        &self.transfer
     }
 
     pub(crate) fn journal_offer(&self) -> &FileOffer {
@@ -135,6 +164,9 @@ impl GuestRecoveryScope {
     pub fn exact_transfer_id(&self) -> &TransferId {
         self.offer.id()
     }
+    pub fn file_offer(&self) -> &FileOffer {
+        self.offer.file_offer()
+    }
     pub fn sender_key(&self) -> &P256Spki {
         &self.sender_spki
     }
@@ -183,6 +215,16 @@ impl GuestRecoveryScope {
 pub(crate) struct LocalGuestOfferConsent {
     session_hash: [u8; 32],
     offer_digest: [u8; 32],
+}
+
+impl LocalGuestOfferConsent {
+    #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+    pub(crate) fn from_audited_linux_qt_action(session: [u8; 32], offer: [u8; 32]) -> Self {
+        Self {
+            session_hash: session,
+            offer_digest: offer,
+        }
+    }
 }
 
 /// Bilateral SAS verification is NOT sufficient to receive a file. This

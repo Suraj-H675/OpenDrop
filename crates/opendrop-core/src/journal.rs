@@ -389,6 +389,44 @@ impl Journal {
         Ok(Some(scope))
     }
 
+    /// Restricted local admission lookup for an existing guest receipt.
+    /// The caller must have a *targeted* reconnect request: no discovery
+    /// enumeration and no public IPC may expose this API as a list of peers.
+    /// A matching public key is NOT yet trusted; fresh strict RPK TLS and
+    /// the original bearer secret are separately mandatory.
+    pub fn guest_recovery_scope_for_targeted_tls(
+        &self,
+        id: &TransferId,
+        claimed_sender: &P256Spki,
+        local_receiver: &P256Spki,
+    ) -> Result<Option<GuestRecoveryScope>, Error> {
+        let Some(scope) = self.load_guest_recovery_scope(id)? else {
+            return Ok(None);
+        };
+        if scope.sender_key() != claimed_sender || scope.receiver_key() != local_receiver {
+            return Ok(None);
+        }
+        let clocks: (i64, i64) = self.db.query_row(
+            "SELECT issued_ms, expires_ms FROM guest_receipt_verifiers WHERE id=?1",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| Error::Unauthorized)?
+            .as_millis();
+        let now = i64::try_from(now).map_err(|_| Error::Unauthorized)?;
+        if clocks.0 < 0
+            || clocks.1 <= clocks.0
+            || clocks.1 - clocks.0 > MAX_RECOVERY_MILLIS
+            || now < clocks.0
+            || now >= clocks.1
+        {
+            return Ok(None);
+        }
+        Ok(Some(scope))
+    }
+
     /// NEVER upgrades intent to committed or attempts publication. Returns
     /// only the existing S1-A committed receipt after exact guest verifier,
     /// original two keys, offer bytes, and expiry checks.

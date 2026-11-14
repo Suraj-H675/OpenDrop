@@ -41,6 +41,15 @@ jobs:
           cargo --version
           rustfmt --version
 
+      # Temporary verification-branch lockfile resolution for the Linux
+      # hardware PKCS#11 adapter. Once its exact Cargo.lock delta is checked
+      # into this branch, remove this step and restore the locked-only gate.
+      - name: Resolve and inspect new pinned PKCS11 dependencies
+        shell: bash
+        run: |
+          cargo metadata --format-version 1 > /dev/null
+          git diff -- Cargo.lock
+
       - name: Install disposable runner Qt 6 and logind build headers
         shell: bash
         run: |

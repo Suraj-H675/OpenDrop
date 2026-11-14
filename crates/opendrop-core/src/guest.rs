@@ -17,7 +17,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub const GUEST_PROTOCOL: u8 = 1;
 pub const GUEST_ALPN: &[u8] = b"opendrop-s1-guest-v1";
@@ -259,6 +259,7 @@ impl GuestTranscript {
 #[derive(Debug, Default)]
 pub struct GuestAdmission {
     window: Option<Instant>,
+    wall_window: Option<(SystemTime, SystemTime)>,
     active: Arc<AtomicUsize>,
     revoked: Arc<AtomicBool>,
     started: usize,
@@ -268,6 +269,7 @@ impl GuestAdmission {
     pub fn new_closed() -> Self {
         Self {
             window: None,
+            wall_window: None,
             active: Arc::new(AtomicUsize::new(0)),
             revoked: Arc::new(AtomicBool::new(true)),
             started: 0,
@@ -285,6 +287,10 @@ impl GuestAdmission {
         // Prior permits must remain revocable even if the owner reopens.
         self.revoked.store(true, Ordering::Release);
         self.window = now.checked_add(EVERYONE_WINDOW);
+        let wall_now = SystemTime::now();
+        self.wall_window = wall_now
+            .checked_add(EVERYONE_WINDOW)
+            .map(|end| (wall_now, end));
         self.revoked = Arc::new(AtomicBool::new(false));
         self.started = 0;
     }
@@ -295,6 +301,7 @@ impl GuestAdmission {
 
     fn admit_at(&mut self, now: Instant) -> Result<GuestAdmissionPermit, Error> {
         if self.window.is_none_or(|deadline| now >= deadline)
+            || !self.within_wall_window()
             || self.revoked.load(Ordering::Acquire)
             || self.started >= MAX_ATTEMPTS_PER_WINDOW
         {
@@ -313,11 +320,40 @@ impl GuestAdmission {
         let lifetime = now
             .checked_add(APPROVED_SESSION_LIMIT)
             .ok_or(Error::Unauthorized)?;
+        let started_wall = SystemTime::now();
+        let expires_wall = started_wall
+            .checked_add(APPROVED_SESSION_LIMIT)
+            .ok_or(Error::Unauthorized)?;
         Ok(GuestAdmissionPermit {
             active: self.active.clone(),
             revoked: self.revoked.clone(),
             lifetime,
+            started_wall,
+            expires_wall,
         })
+    }
+
+    fn within_wall_window(&self) -> bool {
+        let Some((started, expires)) = self.wall_window else {
+            return false;
+        };
+        let now = SystemTime::now();
+        now >= started && now < expires
+    }
+
+    pub fn remaining_visibility(&self) -> Duration {
+        if self.revoked.load(Ordering::Acquire) || !self.within_wall_window() {
+            return Duration::ZERO;
+        }
+        let monotonic = self
+            .window
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+            .unwrap_or(Duration::ZERO);
+        let wall = self
+            .wall_window
+            .and_then(|(_, end)| end.duration_since(SystemTime::now()).ok())
+            .unwrap_or(Duration::ZERO);
+        monotonic.min(wall)
     }
 
     /// Explicit owner revocation invalidates even previously admitted peers.
@@ -325,6 +361,7 @@ impl GuestAdmission {
     pub fn revoke_from_owner(&mut self) {
         self.revoked.store(true, Ordering::Release);
         self.window = None;
+        self.wall_window = None;
     }
 }
 
@@ -334,6 +371,8 @@ pub struct GuestAdmissionPermit {
     active: Arc<AtomicUsize>,
     revoked: Arc<AtomicBool>,
     lifetime: Instant,
+    started_wall: SystemTime,
+    expires_wall: SystemTime,
 }
 
 impl GuestAdmissionPermit {
@@ -342,7 +381,48 @@ impl GuestAdmissionPermit {
     }
 
     fn valid_at(&self, now: Instant) -> bool {
-        now < self.lifetime && !self.revoked.load(Ordering::Acquire)
+        let wall = SystemTime::now();
+        now < self.lifetime
+            && wall >= self.started_wall
+            && wall < self.expires_wall
+            && !self.revoked.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+extern "C" {
+    fn opendrop_qt_take_guest_visibility_action() -> i32;
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxGuestVisibilityAction {
+    None,
+    Opened,
+    Revoked,
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+impl GuestAdmission {
+    /// Consumed only on the QApplication owner thread. The native callback
+    /// verifies an active local seat and its genuine foreground button event.
+    /// No caller-provided network boolean or terminal flag opens visibility.
+    pub fn poll_linux_qt_owner_action(&mut self) -> Result<LinuxGuestVisibilityAction, Error> {
+        match unsafe { opendrop_qt_take_guest_visibility_action() } {
+            0 => Ok(LinuxGuestVisibilityAction::None),
+            1 => {
+                self.open_from_local_owner_action();
+                Ok(LinuxGuestVisibilityAction::Opened)
+            }
+            2 => {
+                self.revoke_from_owner();
+                Ok(LinuxGuestVisibilityAction::Revoked)
+            }
+            _ => {
+                self.revoke_from_owner();
+                Err(Error::Unauthorized)
+            }
+        }
     }
 }
 impl Drop for GuestAdmissionPermit {

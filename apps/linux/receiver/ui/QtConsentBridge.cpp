@@ -1,6 +1,7 @@
 #include "IncomingOfferDialog.hpp"
 
 #include <QApplication>
+#include <QDialog>
 #include <QCoreApplication>
 #include <QGuiApplication>
 #include <QThread>
@@ -32,6 +33,9 @@ std::unique_ptr<QApplication> foregroundApp;
 std::unique_ptr<QWidget> foregroundWindow;
 QLabel *foregroundStatus = nullptr;
 std::atomic<bool> foregroundStop{false};
+std::atomic<int> pendingGuestVisibilityAction{0};
+QPushButton *guestVisibilityButton = nullptr;
+QPushButton *guestVisibilityOffButton = nullptr;
 volatile std::sig_atomic_t caughtShutdownSignal = 0;
 
 void foreground_signal(int) {
@@ -53,6 +57,7 @@ extern "C" int opendrop_qt_foreground_start() noexcept {
         foregroundApp = std::make_unique<QApplication>(argc, argv);
         foregroundApp->setQuitOnLastWindowClosed(false);
         foregroundStop.store(false, std::memory_order_release);
+        pendingGuestVisibilityAction.store(0, std::memory_order_release);
         caughtShutdownSignal = 0;
         std::signal(SIGINT, foreground_signal);
         std::signal(SIGTERM, foreground_signal);
@@ -65,6 +70,24 @@ extern "C" int opendrop_qt_foreground_start() noexcept {
         foregroundStatus->setTextFormat(Qt::PlainText);
         foregroundStatus->setWordWrap(true);
         layout->addWidget(foregroundStatus);
+        guestVisibilityButton = new QPushButton(
+            QStringLiteral("Allow guest requests for 10 minutes"), foregroundWindow.get());
+        guestVisibilityButton->setEnabled(false);
+        layout->addWidget(guestVisibilityButton);
+        QObject::connect(guestVisibilityButton, &QPushButton::clicked,
+                         foregroundWindow.get(), []() {
+            // This state only records a genuine local widget event.
+            // Rust decides whether the admission policy may be opened.
+            pendingGuestVisibilityAction.store(1, std::memory_order_release);
+        });
+        guestVisibilityOffButton = new QPushButton(
+            QStringLiteral("Stop guest requests"), foregroundWindow.get());
+        guestVisibilityOffButton->setEnabled(false);
+        layout->addWidget(guestVisibilityOffButton);
+        QObject::connect(guestVisibilityOffButton, &QPushButton::clicked,
+                         foregroundWindow.get(), []() {
+            pendingGuestVisibilityAction.store(2, std::memory_order_release);
+        });
         auto *stop = new QPushButton(QStringLiteral("Stop receiving"), foregroundWindow.get());
         layout->addWidget(stop);
         QObject::connect(stop, &QPushButton::clicked, foregroundWindow.get(), []() {
@@ -110,6 +133,9 @@ extern "C" void opendrop_qt_foreground_status(const char *message) noexcept {
 
 extern "C" void opendrop_qt_foreground_shutdown() noexcept {
     foregroundStatus = nullptr;
+    guestVisibilityButton = nullptr;
+    guestVisibilityOffButton = nullptr;
+    pendingGuestVisibilityAction.store(0, std::memory_order_release);
     foregroundWindow.reset();
     foregroundApp.reset();
 }
@@ -164,6 +190,122 @@ std::optional<OwnerSession> currentOwnerSession() {
 }
 
 } // namespace
+
+// Only the QApplication thread may consume the native button action.
+// A packet, IPC message, CLI argument or other application thread cannot
+// manufacture the owner action used to open Everyone visibility.
+extern "C" int opendrop_qt_take_guest_visibility_action() noexcept {
+    try {
+        auto *app = qobject_cast<QApplication *>(QCoreApplication::instance());
+        if (!app || QThread::currentThread() != app->thread() ||
+            foregroundStop.load(std::memory_order_acquire) ||
+            !currentOwnerSession()) {
+            return -1;
+        }
+        return pendingGuestVisibilityAction.exchange(0, std::memory_order_acq_rel);
+    } catch (...) {
+        return -1;
+    }
+}
+
+extern "C" void opendrop_qt_guest_visibility_available(int available) noexcept {
+    try {
+        auto *app = qobject_cast<QApplication *>(QCoreApplication::instance());
+        if (app && guestVisibilityButton &&
+            QThread::currentThread() == app->thread()) {
+            guestVisibilityButton->setEnabled(available == 1);
+            if (guestVisibilityOffButton) {
+                guestVisibilityOffButton->setEnabled(available == 1);
+            }
+        }
+    } catch (...) {
+        foregroundStop.store(true, std::memory_order_release);
+    }
+}
+
+// A second, independent owner-operated dialog. It returns only an event
+// result; Rust alone constructs the typed authorization capability.
+extern "C" int opendrop_qt_present_guest_sas(
+    const char *code,
+    const char *fingerprint,
+    int (*transportStillActive)(const void *),
+    const void *transportContext) noexcept {
+    try {
+        if (!code || !fingerprint || !transportStillActive || !transportContext) {
+            return -1;
+        }
+        auto *app = qobject_cast<QApplication *>(QCoreApplication::instance());
+        if (!app || QThread::currentThread() != app->thread() ||
+            (QGuiApplication::platformName() != QStringLiteral("wayland") &&
+             QGuiApplication::platformName() != QStringLiteral("xcb"))) {
+            return -1;
+        }
+        const auto before = currentOwnerSession();
+        if (!before) {
+            return -1;
+        }
+        const QString codeText = QString::fromUtf8(code);
+        if (codeText.size() != 11 || codeText[5] != QChar('-')) {
+            return -1;
+        }
+        for (int i = 0; i < codeText.size(); ++i) {
+            if (i != 5 && (codeText[i] < QChar('0') || codeText[i] > QChar('9'))) {
+                return -1;
+            }
+        }
+        QDialog dialog;
+        dialog.setWindowTitle(QStringLiteral("Verify nearby device"));
+        auto *layout = new QVBoxLayout(&dialog);
+        auto *instructions = new QLabel(
+            QStringLiteral("Compare this code with the other device. "
+                           "Only continue if every digit matches."), &dialog);
+        instructions->setTextFormat(Qt::PlainText);
+        instructions->setWordWrap(true);
+        layout->addWidget(instructions);
+        auto *sas = new QLabel(codeText, &dialog);
+        sas->setTextFormat(Qt::PlainText);
+        sas->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        sas->setAlignment(Qt::AlignCenter);
+        layout->addWidget(sas);
+        auto *peer = new QLabel(QStringLiteral("Device key: ") +
+                                    QString::fromUtf8(fingerprint), &dialog);
+        peer->setTextFormat(Qt::PlainText);
+        peer->setWordWrap(true);
+        layout->addWidget(peer);
+        auto *match = new QPushButton(QStringLiteral("Codes match"), &dialog);
+        auto *mismatch = new QPushButton(QStringLiteral("Different codes"), &dialog);
+        layout->addWidget(match);
+        layout->addWidget(mismatch);
+        bool matchedFromButton = false;
+        QObject::connect(match, &QPushButton::clicked, &dialog, [&]() {
+            if (dialog.isVisible()) {
+                matchedFromButton = true;
+                dialog.accept();
+            }
+        });
+        QObject::connect(mismatch, &QPushButton::clicked,
+                         &dialog, &QDialog::reject);
+        QTimer watch(&dialog);
+        QObject::connect(&watch, &QTimer::timeout, &dialog, [&]() {
+            if (caughtShutdownSignal != 0 ||
+                foregroundStop.load(std::memory_order_acquire) ||
+                transportStillActive(transportContext) != 1) {
+                dialog.reject();
+            }
+        });
+        watch.start(150);
+        QTimer::singleShot(120000, &dialog, &QDialog::reject);
+        if (dialog.exec() != QDialog::Accepted || !matchedFromButton ||
+            transportStillActive(transportContext) != 1) {
+            return 0;
+        }
+        const auto after = currentOwnerSession();
+        return after && after->name == before->name &&
+               after->seat == before->seat && after->uid == before->uid ? 1 : -1;
+    } catch (...) {
+        return -1;
+    }
+}
 
 // THIS IS NOT A CONSENT TICKET ISSUER. Only core Rust can create a ticket.
 // ABI is intentionally value-only, with no pointer to AuthenticatedSession,

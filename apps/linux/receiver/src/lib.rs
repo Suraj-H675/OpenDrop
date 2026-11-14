@@ -19,8 +19,9 @@ pub mod tls;
 pub use inventory::RestartReport;
 
 use opendrop_core::authorization::{
-    request_linux_qt_owner_consent, AuthenticatedSession, ConsentPrompt,
+    request_linux_qt_owner_consent, AuthenticatedSession, ConsentPrompt, LinuxQtGuestConsentGrant,
 };
+use opendrop_core::guest_recovery::GuestRecoveryCredential;
 use opendrop_core::journal::{FileOffer, Journal};
 use opendrop_core::receiver::{LocalDestinationLease, ReceiveState, ReceiverCoordinator};
 use opendrop_core::wire::{Control, Frame};
@@ -39,6 +40,11 @@ pub struct SessionCancellation {
 }
 
 impl SessionCancellation {
+    /// Borrow the live flag of an already established guest RPK transport.
+    /// This can only revoke a session; it cannot mint any consent capability.
+    pub fn from_transport_flag(active: Arc<AtomicBool>) -> Self {
+        Self { active }
+    }
     pub fn invalidate(&self) {
         self.active.store(false, Ordering::Release);
     }
@@ -65,6 +71,40 @@ pub struct ForegroundLinuxReceiver {
 }
 
 impl ForegroundLinuxReceiver {
+    /// Only accepts an opaque grant returned by the *second* genuine Qt
+    /// Accept button, following bilateral guest SAS verification. This
+    /// creates no parallel storage/receiver implementation.
+    pub fn after_guest_owner_approval(
+        grant: LinuxQtGuestConsentGrant,
+        journal: &mut Journal,
+        store: LinuxReceiverStorage,
+        active: Arc<AtomicBool>,
+    ) -> Result<(Self, GuestRecoveryCredential), Error> {
+        if !active.load(Ordering::Acquire) {
+            return Err(Error::Unauthorized);
+        }
+        let pinned_store = store
+            .with_pinned_owner_destination(grant.selected_directory(), grant.pinned_directory())?;
+        if grant.destination.owner_approved_directory() != pinned_store.owner_destination_display()
+            || !grant
+                .destination
+                .matches_pinned_directory(pinned_store.pinned_destination())?
+        {
+            return Err(Error::Unauthorized);
+        }
+        let token = GuestRecoveryCredential::generate()?;
+        let coordinator = ReceiverCoordinator::new_guest(grant.authorized, journal, &token)?;
+        Ok((
+            Self {
+                coordinator,
+                store: pinned_store,
+                destination: Some(grant.destination),
+                publisher: None,
+                transport_active: active,
+            },
+            token,
+        ))
+    }
     /// Caller MUST have authenticated the peer certificate and TLS exporter
     /// with the existing AuthenticatedSession::from_verified_tls_server.
     pub fn incoming_offer(

@@ -621,6 +621,58 @@ impl ProvisionalTlsPeer {
         self.live.store(false, Ordering::Release);
     }
 
+    /// A genuine local desktop button action is required before emitting
+    /// either side's proof. The wire cannot invoke this transition directly.
+    #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+    pub fn request_linux_qt_sas(self) -> Result<AwaitingPeerConfirmation, Error> {
+        use std::ffi::{c_char, c_void, CString};
+
+        unsafe extern "C" fn still_active(context: *const c_void) -> i32 {
+            if context.is_null() {
+                return 0;
+            }
+            let active = unsafe { &*(context as *const AtomicBool) };
+            i32::from(active.load(Ordering::Acquire))
+        }
+
+        extern "C" {
+            fn opendrop_qt_present_guest_sas(
+                code: *const c_char,
+                fingerprint: *const c_char,
+                live: unsafe extern "C" fn(*const c_void) -> i32,
+                live_context: *const c_void,
+            ) -> i32;
+        }
+
+        if !self.live.load(Ordering::Acquire)
+            || self.deadline <= Instant::now()
+            || self
+                .admission
+                .as_ref()
+                .is_some_and(|permit| !permit.is_active())
+        {
+            self.abort_for_mismatch();
+            return Err(Error::Unauthorized);
+        }
+        let code =
+            CString::new(self.displayed_code()).map_err(|_| Error::Invalid("guest SAS display"))?;
+        let fingerprint = CString::new(self.peer_public_key().fingerprint().to_hex())
+            .map_err(|_| Error::Invalid("guest key display"))?;
+        let decision = unsafe {
+            opendrop_qt_present_guest_sas(
+                code.as_ptr(),
+                fingerprint.as_ptr(),
+                still_active,
+                (self.live.as_ref() as *const AtomicBool).cast::<c_void>(),
+            )
+        };
+        if decision != 1 {
+            self.abort_for_mismatch();
+            return Err(Error::Unauthorized);
+        }
+        self.accept_local_human_code(MatchedCodeOwnerAction { _private: () })
+    }
+
     // No public caller-supplied bool can advance this state. Future Linux
     // Qt/Android/Windows *trusted in-process UI issuers* are implemented in
     // their platform adapters; until then real guest approval fails closed.

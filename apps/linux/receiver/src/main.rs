@@ -5,6 +5,7 @@
 //! AND an existing, nonrevoked journal pairing. The real owner Qt modal is
 //! the only incoming-offer approval path.
 
+mod guest_signer;
 mod runtime;
 
 fn main() {

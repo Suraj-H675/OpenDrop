@@ -483,11 +483,12 @@ extern "C" {
 /// single-use session+offer binding. The TLS owner MUST mark its cancellation
 /// flag when the socket closes; no native listener exists yet.
 #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
-pub fn request_linux_qt_owner_consent(
-    prompt: ConsentPrompt,
+fn present_linux_qt_pinned_directory(
+    offer: &FileOffer,
+    displayed_device: &str,
     initial_destination: &Path,
     transport_active: &Arc<AtomicBool>,
-) -> Result<LinuxQtConsentGrant, Error> {
+) -> Result<(PathBuf, File), Error> {
     if !transport_active.load(Ordering::Acquire) {
         return Err(Error::Unauthorized);
     }
@@ -501,11 +502,11 @@ pub fn request_linux_qt_owner_consent(
     {
         return Err(Error::Invalid("initial owner destination"));
     }
-    let device = qt_arg(prompt.device.as_str())?;
-    let peer = qt_arg(prompt.offer.peer.as_str())?;
-    let transfer = qt_arg(prompt.offer.id.as_str())?;
-    let file_name = qt_arg(&prompt.offer.name)?;
-    let checksum = qt_arg(prompt.offer.sha256.as_str())?;
+    let device = qt_arg(displayed_device)?;
+    let peer = qt_arg(offer.peer.as_str())?;
+    let transfer = qt_arg(offer.id.as_str())?;
+    let file_name = qt_arg(&offer.name)?;
+    let checksum = qt_arg(offer.sha256.as_str())?;
     let initial_dir = qt_arg(initial)?;
     let mut selected = [0i8; 4097];
     let mut pinned = QtPinnedDestination::default();
@@ -518,7 +519,7 @@ pub fn request_linux_qt_owner_consent(
             transfer.as_ptr(),
             file_name.as_ptr(),
             checksum.as_ptr(),
-            prompt.offer.bytes,
+            offer.bytes,
             initial_dir.as_ptr(),
             qt_pin_owner_directory,
             (&mut pinned as *mut QtPinnedDestination).cast::<c_void>(),
@@ -558,6 +559,21 @@ pub fn request_linux_qt_owner_consent(
     if pinned_path != selected_path {
         return Err(Error::Unauthorized);
     }
+    Ok((selected_path, pinned_directory))
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+pub fn request_linux_qt_owner_consent(
+    prompt: ConsentPrompt,
+    initial_destination: &Path,
+    transport_active: &Arc<AtomicBool>,
+) -> Result<LinuxQtConsentGrant, Error> {
+    let (selected_path, pinned_directory) = present_linux_qt_pinned_directory(
+        &prompt.offer,
+        prompt.device.as_str(),
+        initial_destination,
+        transport_active,
+    )?;
     let pinned_stat = pinned_directory.metadata()?;
     let binding = consent_binding(&prompt.session, &prompt.device, &prompt.offer);
     consume_qt_binding(binding, transport_active)?;
@@ -577,6 +593,76 @@ pub fn request_linux_qt_owner_consent(
         ticket,
         destination,
         selected_directory: selected_path,
+        pinned_directory,
+    })
+}
+
+/// Guest SAS approval has already happened on this session. The *second*
+/// owner dialog must independently accept the exact file and destination
+/// before this nonforgeable guest authorization can exist.
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+pub struct LinuxQtGuestConsentGrant {
+    pub authorized: crate::guest_recovery::GuestAuthorizedTransfer,
+    pub destination: crate::receiver::LocalDestinationLease,
+    selected_directory: PathBuf,
+    pinned_directory: File,
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+impl LinuxQtGuestConsentGrant {
+    pub fn selected_directory(&self) -> &Path {
+        &self.selected_directory
+    }
+    pub fn pinned_directory(&self) -> &File {
+        &self.pinned_directory
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+pub fn request_linux_qt_guest_offer_consent(
+    verified: crate::guest_tls::VerifiedGuestSession,
+    offer: crate::guest_recovery::GuestOfferV1,
+    initial_destination: &Path,
+    transport_active: &Arc<AtomicBool>,
+) -> Result<LinuxQtGuestConsentGrant, Error> {
+    if !verified.is_active()
+        || verified.local_transfer_side() != crate::guest::TransferSide::Receiver
+        || verified.logical_sender_spki() != offer.sender()
+    {
+        return Err(Error::Unauthorized);
+    }
+    let binding = *verified.session_binding();
+    let digest = offer.canonical_digest();
+    let (selected_directory, pinned_directory) = present_linux_qt_pinned_directory(
+        offer.file_offer(),
+        &offer.sender().to_hex(),
+        initial_destination,
+        transport_active,
+    )?;
+    if !verified.is_active() || !transport_active.load(Ordering::Acquire) {
+        return Err(Error::Unauthorized);
+    }
+    let pinned_stat = pinned_directory.metadata()?;
+    let mut one_use = Sha256::new();
+    one_use.update(b"OpenDrop/S1/GuestOwnerOfferConsent/v1\0");
+    one_use.update(binding);
+    one_use.update(digest);
+    consume_qt_binding(one_use.finalize().into(), transport_active)?;
+    let destination = crate::receiver::LocalDestinationLease::from_local_qt_owner_action(
+        offer.file_offer(),
+        selected_directory.clone(),
+        binding,
+        pinned_stat.dev(),
+        pinned_stat.ino(),
+    )?;
+    let action = crate::guest_recovery::LocalGuestOfferConsent::from_audited_linux_qt_action(
+        binding, digest,
+    );
+    let authorized = verified.authorize_guest_offer_from_owner_ui(offer, action)?;
+    Ok(LinuxQtGuestConsentGrant {
+        authorized,
+        destination,
+        selected_directory,
         pinned_directory,
     })
 }
