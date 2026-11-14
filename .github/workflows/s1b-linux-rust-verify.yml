@@ -53,6 +53,12 @@ jobs:
       - name: Compile and test shared core and Linux receiver
         run: cargo test -p opendrop-core -p opendrop-linux-receiver --locked
 
+      # A second isolated test compilation enables synthetic signers and
+      # owner actions only for the unit-test harness. The production executable
+      # is separately linked below WITHOUT this feature and has no fake signer.
+      - name: Exercise real guest TCP TLS filesystem and receipt-only loopback
+        run: cargo test -p opendrop-linux-receiver --bin opendrop-linux-receiver --features hosted-guest-fixture --locked
+
       - name: Link the actual foreground Linux receiver executable
         run: cargo build -p opendrop-linux-receiver --bin opendrop-linux-receiver --locked
 

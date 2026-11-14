@@ -235,6 +235,19 @@ pub struct GuestAuthorizedTransfer {
 }
 
 impl VerifiedGuestSession {
+    #[cfg(feature = "hosted-guest-fixture")]
+    #[doc(hidden)]
+    pub fn approve_offer_for_hosted_guest_fixture(
+        self,
+        offered: GuestOfferV1,
+    ) -> Result<GuestAuthorizedTransfer, Error> {
+        let action = LocalGuestOfferConsent {
+            session_hash: *self.session_binding(),
+            offer_digest: offered.canonical_digest(),
+        };
+        self.authorize_guest_offer_from_owner_ui(offered, action)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn authorize_guest_offer_from_owner_ui(
         self,

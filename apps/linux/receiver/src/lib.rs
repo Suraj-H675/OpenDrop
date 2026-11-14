@@ -21,7 +21,11 @@ pub use inventory::RestartReport;
 use opendrop_core::authorization::{
     request_linux_qt_owner_consent, AuthenticatedSession, ConsentPrompt, LinuxQtGuestConsentGrant,
 };
+#[cfg(feature = "hosted-guest-fixture")]
+use opendrop_core::guest_recovery::GuestOfferV1;
 use opendrop_core::guest_recovery::GuestRecoveryCredential;
+#[cfg(feature = "hosted-guest-fixture")]
+use opendrop_core::guest_tls::VerifiedGuestSession;
 use opendrop_core::journal::{FileOffer, Journal};
 use opendrop_core::receiver::{LocalDestinationLease, ReceiveState, ReceiverCoordinator};
 use opendrop_core::wire::{Control, Frame};
@@ -79,6 +83,45 @@ pub struct ForegroundLinuxReceiver {
 }
 
 impl ForegroundLinuxReceiver {
+    /// Compiled only for the explicit hosted-test feature. Builds cannot
+    /// select these synthetic actions through CLI/network; the real app
+    /// uses the Qt gesture and pinned-folder ceremony above.
+    #[cfg(feature = "hosted-guest-fixture")]
+    #[doc(hidden)]
+    pub fn after_hosted_guest_fixture_approval(
+        verified: VerifiedGuestSession,
+        offer: GuestOfferV1,
+        journal: &mut Journal,
+        store: LinuxReceiverStorage,
+        active: Arc<AtomicBool>,
+    ) -> Result<(Self, GuestRecoveryCredential), Error> {
+        if !active.load(Ordering::Acquire) || verified.logical_sender_spki() != offer.sender() {
+            return Err(Error::Unauthorized);
+        }
+        let destination = LocalDestinationLease::from_hosted_guest_fixture(
+            offer.file_offer(),
+            store.owner_destination_display().to_path_buf(),
+            *verified.session_binding(),
+            store.pinned_destination(),
+        )?;
+        if !destination.matches_pinned_directory(store.pinned_destination())? {
+            return Err(Error::Unauthorized);
+        }
+        let authorized = verified.approve_offer_for_hosted_guest_fixture(offer)?;
+        let token = GuestRecoveryCredential::generate()?;
+        let coordinator = ReceiverCoordinator::new_guest(authorized, journal, &token)?;
+        Ok((
+            Self {
+                coordinator,
+                store,
+                destination: Some(destination),
+                publisher: None,
+                transport_active: active,
+            },
+            token,
+        ))
+    }
+
     /// Only accepts an opaque grant returned by the *second* genuine Qt
     /// Accept button, following bilateral guest SAS verification. This
     /// creates no parallel storage/receiver implementation.

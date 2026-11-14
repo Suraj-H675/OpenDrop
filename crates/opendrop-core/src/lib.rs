@@ -1,6 +1,9 @@
 //! OpenDrop shared identity, security policy, durable journal, and S1 transfer
 //! contracts. No native consent issuer, app transport, or OS file adapter yet.
 
+#[cfg(all(feature = "hosted-guest-fixture", not(debug_assertions)))]
+compile_error!("hosted-guest-fixture owner-action simulation is forbidden in release builds");
+
 pub mod authorization;
 pub mod guest;
 pub mod guest_recovery;

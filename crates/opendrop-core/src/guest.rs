@@ -283,6 +283,12 @@ impl GuestAdmission {
         self.open_at(Instant::now());
     }
 
+    #[cfg(feature = "hosted-guest-fixture")]
+    #[doc(hidden)]
+    pub fn open_for_hosted_guest_fixture(&mut self) {
+        self.open_at(Instant::now());
+    }
+
     fn open_at(&mut self, now: Instant) {
         // Prior permits must remain revocable even if the owner reopens.
         self.revoked.store(true, Ordering::Release);

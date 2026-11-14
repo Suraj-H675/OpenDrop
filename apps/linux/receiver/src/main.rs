@@ -7,6 +7,11 @@
 //! public-key TLS 1.3, a genuine local Qt SAS gesture, peer confirmation, and
 //! a *second* exact-offer local Qt Accept. Neither mode auto-enrolls peers.
 
+// The source-only fake signer and owner-action constructors are available
+// solely to hosted unit tests and never to a release executable.
+#[cfg(all(feature = "hosted-guest-fixture", not(debug_assertions)))]
+compile_error!("hosted-guest-fixture is forbidden for production release builds");
+
 mod guest_signer;
 mod runtime;
 

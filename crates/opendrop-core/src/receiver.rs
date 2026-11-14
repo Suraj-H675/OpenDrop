@@ -72,6 +72,22 @@ pub struct LocalDestinationLease {
 
 #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
 impl LocalDestinationLease {
+    #[cfg(feature = "hosted-guest-fixture")]
+    #[doc(hidden)]
+    pub fn from_hosted_guest_fixture(
+        offer: &FileOffer,
+        selected_directory: std::path::PathBuf,
+        binding: [u8; 32],
+        pinned_directory: &std::fs::File,
+    ) -> Result<Self, Error> {
+        use std::os::unix::fs::MetadataExt;
+        let stat = pinned_directory.metadata()?;
+        if !stat.is_dir() || stat.mode() & 0o022 != 0 {
+            return Err(Error::Unauthorized);
+        }
+        Self::from_local_qt_owner_action(offer, selected_directory, binding, stat.dev(), stat.ino())
+    }
+
     /// Internal constructor, only reachable through the security module's
     /// Qt modal owner gesture. No public arbitrary path/approval constructor.
     pub(crate) fn from_local_qt_owner_action(

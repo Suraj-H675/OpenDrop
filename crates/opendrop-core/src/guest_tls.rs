@@ -621,6 +621,12 @@ impl ProvisionalTlsPeer {
         self.live.store(false, Ordering::Release);
     }
 
+    #[cfg(feature = "hosted-guest-fixture")]
+    #[doc(hidden)]
+    pub fn approve_sas_for_hosted_guest_fixture(self) -> Result<AwaitingPeerConfirmation, Error> {
+        self.accept_local_human_code(MatchedCodeOwnerAction { _private: () })
+    }
+
     /// A genuine local desktop button action is required before emitting
     /// either side's proof. The wire cannot invoke this transition directly.
     #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
