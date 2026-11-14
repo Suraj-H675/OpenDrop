@@ -87,11 +87,15 @@ fn read_tcp(
     socket: &mut TcpStream,
     data: &mut [u8],
     running: &AtomicBool,
+    live: &AtomicBool,
 ) -> Result<(), &'static str> {
     let started = Instant::now();
     let mut offset = 0;
     while offset < data.len() {
-        if !running.load(Ordering::Acquire) || started.elapsed() >= HANDSHAKE_LIMIT {
+        if !running.load(Ordering::Acquire)
+            || !live.load(Ordering::Acquire)
+            || started.elapsed() >= HANDSHAKE_LIMIT
+        {
             return Err("guest introduction timeout");
         }
         match socket.read(&mut data[offset..]) {
@@ -246,7 +250,7 @@ fn serve_guest(
         .map_err(|_| "guest visibility closed")?;
     let transport = connected_guest(guest)?;
     let mut hello = [0u8; HELLO_LEN];
-    read_tcp(&mut socket, &mut hello, running)?;
+    read_tcp(&mut socket, &mut hello, running, &transport.live)?;
     let client = GuestHello::parse(&hello).map_err(|_| "invalid guest hello")?;
     let server = guest
         .identity
@@ -254,6 +258,14 @@ fn serve_guest(
         .map_err(|_| "local guest introduction")?;
     let transcript = GuestTranscript::new(client, server.clone())
         .map_err(|_| "guest roles or key reflection")?;
+    // A withdrawn Everyone grant must not disclose the owner's stable SPKI
+    // even if the untrusted peer raced to finish its targeted introduction.
+    if !running.load(Ordering::Acquire)
+        || !transport.live.load(Ordering::Acquire)
+        || !permit.is_active()
+    {
+        return Err("guest visibility or transport revoked before identity reply");
+    }
     socket
         .write_all(&server.encoded())
         .map_err(|_| "guest introduction reply")?;
@@ -352,7 +364,7 @@ fn serve_recovery(
 ) -> Result<(), &'static str> {
     let transport = connected_guest(guest)?;
     let mut introduction = [0u8; RECOVERY_PREFACE_LEN];
-    read_tcp(&mut socket, &mut introduction, running)?;
+    read_tcp(&mut socket, &mut introduction, running, &transport.live)?;
     if &introduction[..4] != RECOVERY_MAGIC {
         return Err("invalid guest recovery preface");
     }
@@ -379,6 +391,9 @@ fn serve_recovery(
         .map_err(|_| "local receipt recovery introduction")?;
     let transcript = GuestTranscript::new(client, server.clone())
         .map_err(|_| "guest receipt recovery role mismatch")?;
+    if !running.load(Ordering::Acquire) || !transport.live.load(Ordering::Acquire) {
+        return Err("guest recovery transport revoked before identity reply");
+    }
     socket
         .write_all(&server.encoded())
         .map_err(|_| "recovery server hello")?;
