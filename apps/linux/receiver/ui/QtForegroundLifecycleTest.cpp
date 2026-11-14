@@ -23,9 +23,14 @@ int main() {
     }
     bool clicked = false;
     for (QWidget *widget : QApplication::topLevelWidgets()) {
-        if (auto *button = widget->findChild<QPushButton *>()) {
-            QTest::mouseClick(button, Qt::LeftButton);
-            clicked = true;
+        for (QPushButton *button : widget->findChildren<QPushButton *>()) {
+            if (button->text() == QStringLiteral("Stop receiving") && button->isEnabled()) {
+                QTest::mouseClick(button, Qt::LeftButton);
+                clicked = true;
+                break;
+            }
+        }
+        if (clicked) {
             break;
         }
     }
