@@ -9,6 +9,7 @@ use crate::authorization::{
     authorize_local_consent, review_incoming, AuthenticatedSession, AuthorizedOffer, ConsentPrompt,
     ConsentTicket, OfferDecision,
 };
+use crate::guest_recovery::{GuestAuthorizedTransfer, GuestRecoveryCredential};
 use crate::journal::{DurablePublisher, FileOffer, Journal, Phase, Receipt};
 use crate::wire::{self, Control, Frame};
 use crate::Error;
@@ -142,14 +143,80 @@ pub trait StagingLease: Send {
 /// AuthorizedOffer can only originate from the established authorization
 /// boundary, which verifies exporter, peer certificate and offer identity.
 pub struct ReceiverCoordinator {
-    session: AuthenticatedSession,
+    authority: ReceiverAuthority,
     offer: FileOffer,
     state: ReceiveState,
-    authorization: Option<AuthorizedOffer>,
     staging: Option<Box<dyn StagingLease>>,
     seen: u64,
     hash: Sha256,
     receipt: Option<Receipt>,
+}
+
+// The same durable receiver handles two *disjoint* authorization domains.
+// A guest SPKI cannot be reinterpreted as a legacy paired certificate.
+enum ReceiverAuthority {
+    Paired {
+        session: AuthenticatedSession,
+        authorized: Option<AuthorizedOffer>,
+    },
+    Guest(GuestAuthorizedTransfer),
+}
+
+impl ReceiverAuthority {
+    fn is_active_and_authorized(&self) -> bool {
+        match self {
+            Self::Paired { authorized, .. } => authorized.is_some(),
+            Self::Guest(guest) => guest.is_active(),
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
+    fn matches_lease(&self, offer: &FileOffer, binding: &[u8; 32]) -> bool {
+        match self {
+            Self::Paired { session, .. } => {
+                crate::authorization::matches_native_lease(session, offer, binding)
+            }
+            Self::Guest(guest) => {
+                guest.is_active()
+                    && guest.journal_offer() == offer
+                    && guest.session_binding() == binding
+            }
+        }
+    }
+
+    fn record_commit_intent(
+        &self,
+        journal: &mut Journal,
+        destination_ref: &str,
+    ) -> Result<(), Error> {
+        match self {
+            Self::Paired {
+                session,
+                authorized,
+            } => authorized
+                .as_ref()
+                .ok_or(Error::Unauthorized)?
+                .record_commit_intent(journal, session, destination_ref),
+            Self::Guest(guest) => guest.record_commit_intent(journal, destination_ref),
+        }
+    }
+
+    fn publish_with(
+        &self,
+        journal: &mut Journal,
+        publisher: &mut impl DurablePublisher,
+    ) -> Result<Receipt, Error> {
+        match self {
+            Self::Paired {
+                session,
+                authorized,
+            } => authorized
+                .as_ref()
+                .ok_or(Error::Unauthorized)?
+                .publish_with(journal, session, publisher),
+            Self::Guest(guest) => guest.publish_with(journal, publisher),
+        }
+    }
 }
 
 impl ReceiverCoordinator {
@@ -168,16 +235,45 @@ impl ReceiverCoordinator {
             }
         };
         let coordinator = Self {
-            session,
+            authority: ReceiverAuthority::Paired {
+                session,
+                authorized: None,
+            },
             offer,
             state: ReceiveState::AwaitingConsent,
-            authorization: None,
             staging: None,
             seen: 0,
             hash: Sha256::new(),
             receipt: None,
         };
         Ok((coordinator, prompt))
+    }
+
+    /// The only guest entry point. The opaque capability has already passed
+    /// bilateral SAS and a separate exact-offer owner action. No network
+    /// metadata, bool or public key alone can construct it.
+    pub fn new_guest(
+        authorized: GuestAuthorizedTransfer,
+        journal: &mut Journal,
+        recovery: &GuestRecoveryCredential,
+    ) -> Result<Self, Error> {
+        let offer = authorized.journal_offer().clone();
+        wire::validate_offer(&offer)?;
+        if !authorized.is_active() {
+            return Err(Error::Unauthorized);
+        }
+        authorized.reserve_with_recovery(journal, recovery)?;
+        let snapshot = journal.lookup(&offer)?.ok_or(Error::InvalidState)?;
+        require_receiving_phase(snapshot.phase)?;
+        Ok(Self {
+            authority: ReceiverAuthority::Guest(authorized),
+            offer,
+            state: ReceiveState::Accepted,
+            staging: None,
+            seen: 0,
+            hash: Sha256::new(),
+            receipt: None,
+        })
     }
 
     pub fn state(&self) -> ReceiveState {
@@ -202,20 +298,27 @@ impl ReceiverCoordinator {
         if self.state != ReceiveState::AwaitingConsent {
             return Err(Error::InvalidState);
         }
-        let authorized = authorize_local_consent(journal, &self.session, &self.offer, ticket)?;
-        let reservation = authorized.reserve(journal, &self.session)?;
+        let ReceiverAuthority::Paired {
+            session,
+            authorized: slot,
+        } = &mut self.authority
+        else {
+            return Err(Error::Unauthorized);
+        };
+        let authorized = authorize_local_consent(journal, session, &self.offer, ticket)?;
+        let reservation = authorized.reserve(journal, session)?;
         // `reserve` is intentionally idempotent for recovery and exact
         // receipt lookup. A newly accepted stream must NOT reuse a journal
         // record that already entered publication or was committed.
         require_receiving_phase(reservation.phase)?;
-        self.authorization = Some(authorized);
+        *slot = Some(authorized);
         self.state = ReceiveState::Accepted;
         Ok(())
     }
 
     pub fn start_receiving(&mut self, staging: Box<dyn StagingLease>) -> Result<(), Error> {
         if self.state != ReceiveState::Accepted
-            || self.authorization.is_none()
+            || !self.authority.is_active_and_authorized()
             || self.staging.is_some()
         {
             return Err(Error::InvalidState);
@@ -230,6 +333,10 @@ impl ReceiverCoordinator {
     pub fn note_staged_chunk(&mut self, bytes: &[u8]) -> Result<(), Error> {
         if self.state != ReceiveState::Receiving {
             return Err(Error::InvalidState);
+        }
+        if !self.authority.is_active_and_authorized() {
+            self.fail()?;
+            return Err(Error::Unauthorized);
         }
         if bytes.is_empty() || bytes.len() > wire::MAX_CHUNK {
             self.fail()?;
@@ -261,6 +368,10 @@ impl ReceiverCoordinator {
     pub fn finish_stream(&mut self, end: &Control) -> Result<(), Error> {
         if self.state != ReceiveState::Receiving {
             return Err(Error::InvalidState);
+        }
+        if !self.authority.is_active_and_authorized() {
+            self.fail()?;
+            return Err(Error::Unauthorized);
         }
         // The transport adapter must pass the authenticated End frame, not
         // infer completion merely from EOF or the advertised byte count.
@@ -298,15 +409,12 @@ impl ReceiverCoordinator {
         }
         #[cfg(all(target_os = "linux", feature = "linux-qt-consent"))]
         if destination.reference != self.offer.name
-            || !crate::authorization::matches_native_lease(
-                &self.session,
-                &self.offer,
-                &destination.session_offer_binding,
-            )
+            || !self
+                .authority
+                .matches_lease(&self.offer, &destination.session_offer_binding)
         {
             return Err(Error::Unauthorized);
         }
-        let authorized = self.authorization.as_ref().ok_or(Error::Unauthorized)?;
         // The existing AuthorizedOffer verifies the session/visibility
         // BEFORE invoking Journal::record_commit_intent. Its Unauthorized
         // result therefore cannot represent a completed journal write, and
@@ -314,7 +422,10 @@ impl ReceiverCoordinator {
         // may leave an uncertain durable intent and MUST preserve staging.
         // Revisit this classification if the authorization or journal APIs
         // ever acquire post-mutation Unauthorized failures.
-        match authorized.record_commit_intent(journal, &self.session, &destination.reference) {
+        match self
+            .authority
+            .record_commit_intent(journal, &destination.reference)
+        {
             Ok(()) => {
                 self.state = ReceiveState::CommitIntent;
                 Ok(())
@@ -342,8 +453,7 @@ impl ReceiverCoordinator {
         if self.state != ReceiveState::CommitIntent {
             return Err(Error::InvalidState);
         }
-        let authorized = self.authorization.as_ref().ok_or(Error::Unauthorized)?;
-        let result = authorized.publish_with(journal, &self.session, publisher);
+        let result = self.authority.publish_with(journal, publisher);
         match result {
             Ok(receipt) if receipt_matches(&self.offer, &receipt) => {
                 self.receipt = Some(receipt);

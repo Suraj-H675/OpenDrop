@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 
 const SAS_EXPORTER: &[u8] = b"EXPORTER-OpenDrop-S1-SAS-v1";
 const CONFIRM_EXPORTER: &[u8] = b"EXPORTER-OpenDrop-S1-Confirm-v1";
+const SESSION_EXPORTER: &[u8] = b"EXPORTER-OpenDrop-S1-SessionBinding-v1";
 const CONFIRM_MAGIC: &[u8; 4] = b"ODGC";
 pub const CONFIRM_LEN: usize = 38;
 const SAS_MODULUS: u64 = 10_000_000_000;
@@ -382,6 +383,7 @@ pub struct ProvisionalTlsPeer {
     transcript: GuestTranscript,
     local_tls_side: TlsSide,
     transcript_hash: [u8; 32],
+    session_binding: [u8; 32],
     sas: String,
     proof_key: [u8; 32],
     live: Arc<AtomicBool>,
@@ -579,6 +581,9 @@ impl ProvisionalTlsPeer {
         );
         let sas_key = exporter(SAS_EXPORTER, &hash).map_err(|_| Error::Unauthorized)?;
         let proof_key = exporter(CONFIRM_EXPORTER, &hash).map_err(|_| Error::Unauthorized)?;
+        // The public transcript digest alone is not a session secret. Bind
+        // subsequent owner actions to this *fresh TLS connection* instead.
+        let session_binding = exporter(SESSION_EXPORTER, &hash).map_err(|_| Error::Unauthorized)?;
         let sas = sas_from_uniform_exporter(&sas_key)?;
         let deadline = Instant::now()
             .checked_add(PAIRING_DEADLINE)
@@ -587,6 +592,7 @@ impl ProvisionalTlsPeer {
             transcript,
             local_tls_side: local_role,
             transcript_hash: hash,
+            session_binding,
             sas,
             proof_key,
             live,
@@ -736,7 +742,7 @@ impl AwaitingPeerConfirmation {
         }
         Ok(VerifiedGuestSession {
             transcript: self.provisional.transcript,
-            binding: self.provisional.transcript_hash,
+            binding: self.provisional.session_binding,
             local_tls_side: self.provisional.local_tls_side,
             live: self.provisional.live,
             admission: self.provisional.admission,

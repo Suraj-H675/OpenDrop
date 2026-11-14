@@ -225,6 +225,40 @@ impl GuestAuthorizedTransfer {
         &self.scope
     }
 
+    pub(crate) fn journal_offer(&self) -> &FileOffer {
+        self.scope.offer.journal_offer()
+    }
+
+    pub(crate) fn session_binding(&self) -> &[u8; 32] {
+        self.session.session_binding()
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.session.is_active()
+    }
+
+    pub(crate) fn record_commit_intent(
+        &self,
+        journal: &mut Journal,
+        destination_ref: &str,
+    ) -> Result<(), Error> {
+        if !self.session.is_active() {
+            return Err(Error::Unauthorized);
+        }
+        journal.record_commit_intent(self.scope.offer.journal_offer(), destination_ref)
+    }
+
+    pub(crate) fn publish_with(
+        &self,
+        journal: &mut Journal,
+        publisher: &mut impl crate::journal::DurablePublisher,
+    ) -> Result<Receipt, Error> {
+        if !self.session.is_active() {
+            return Err(Error::Unauthorized);
+        }
+        journal.publish_with(self.scope.offer.journal_offer(), publisher)
+    }
+
     /// Reuses S1-A's single reserve transaction. A successful return is
     /// required before native staging can begin. The second journal write
     /// stores ONLY a credential verifier and exact identity binding.
