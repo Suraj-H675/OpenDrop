@@ -608,9 +608,12 @@ impl ProvisionalTlsPeer {
         }
     }
 
-    /// Consuming this session on a mismatch prevents a second guess on the
-    /// same TLS connection; the foreground admission policy limits retries.
-    pub fn abort_for_mismatch(self) {}
+    /// A mismatched code revokes the transport-owned session flag immediately
+    /// and consumes the provisional capability. The native transport owner
+    /// must also close the TLS socket when it observes this revoked flag.
+    pub fn abort_for_mismatch(self) {
+        self.live.store(false, Ordering::Release);
+    }
 
     // No public caller-supplied bool can advance this state. Future Linux
     // Qt/Android/Windows *trusted in-process UI issuers* are implemented in
@@ -628,6 +631,7 @@ impl ProvisionalTlsPeer {
                 .as_ref()
                 .is_some_and(|permit| !permit.is_active())
         {
+            self.live.store(false, Ordering::Release);
             return Err(Error::Unauthorized);
         }
         Ok(AwaitingPeerConfirmation { provisional: self })
@@ -711,6 +715,7 @@ impl AwaitingPeerConfirmation {
                 .as_ref()
                 .is_some_and(|permit| !permit.is_active())
         {
+            self.provisional.live.store(false, Ordering::Release);
             return Err(Error::Unauthorized);
         }
         let opposite = match self.provisional.local_tls_side {
@@ -726,6 +731,7 @@ impl AwaitingPeerConfirmation {
             )
             .is_err()
         {
+            self.provisional.live.store(false, Ordering::Release);
             return Err(Error::Unauthorized);
         }
         Ok(VerifiedGuestSession {
@@ -1056,7 +1062,18 @@ mod tests {
             .unwrap();
         let own_proof = confirming.outgoing_confirmation().unwrap();
         assert!(confirming.verify_peer_then_finish(&own_proof).is_err());
-        live.store(false, Ordering::Release);
+        assert!(!live.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn mismatched_code_aborts_transport_and_cannot_authorize_offer() {
+        let (_, _, transcript, mut client, mut server) = tls_pair();
+        exchange(&mut client, &mut server).unwrap();
+        let live = Arc::new(AtomicBool::new(true));
+        let provisional =
+            ProvisionalTlsPeer::from_completed_client(&client, transcript, live.clone()).unwrap();
+        provisional.abort_for_mismatch();
+        assert!(!live.load(Ordering::Acquire));
     }
 
     #[test]
