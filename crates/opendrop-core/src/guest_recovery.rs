@@ -466,6 +466,95 @@ mod tests {
     }
 
     #[test]
+    fn targeted_receipt_recovery_is_read_only_exact_key_and_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&dir.path().join("targeted-recovery.sqlite")).unwrap();
+        let scope = test_scope();
+        let credential = GuestRecoveryCredential::generate().unwrap();
+        let now = authoritative_local_now_millis().unwrap();
+        journal.reserve(scope.offer.journal_offer()).unwrap();
+        journal
+            .register_guest_receipt_verifier(
+                &scope,
+                scope.verifier(&credential),
+                now,
+                now + MAX_RECOVERY_MILLIS,
+            )
+            .unwrap();
+        let looked_up = journal
+            .guest_recovery_scope_for_targeted_tls(
+                scope.exact_transfer_id(),
+                scope.sender_key(),
+                scope.receiver_key(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(looked_up.offer_digest(), scope.offer_digest());
+        assert!(journal
+            .guest_recovery_scope_for_targeted_tls(
+                scope.exact_transfer_id(),
+                &test_spki(7),
+                scope.receiver_key(),
+            )
+            .unwrap()
+            .is_none());
+        assert!(journal
+            .guest_recovery_scope_for_targeted_tls(
+                scope.exact_transfer_id(),
+                scope.sender_key(),
+                &test_spki(8),
+            )
+            .unwrap()
+            .is_none());
+        assert!(journal
+            .read_guest_committed_receipt_exact(&looked_up, &credential, now)
+            .unwrap()
+            .is_none());
+        journal
+            .record_commit_intent(scope.offer.journal_offer(), "guest.txt")
+            .unwrap();
+        assert!(journal
+            .read_guest_committed_receipt_exact(&looked_up, &credential, now)
+            .unwrap()
+            .is_none());
+        journal
+            .publish_with(scope.offer.journal_offer(), &mut TestOnlyPublished)
+            .unwrap();
+        let committed = journal
+            .read_guest_committed_receipt_exact(&looked_up, &credential, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.transfer_id, scope.exact_transfer_id().clone());
+        assert_eq!(
+            journal
+                .lookup(scope.offer.journal_offer())
+                .unwrap()
+                .unwrap()
+                .phase,
+            Phase::Committed
+        );
+
+        let expired = tempfile::tempdir().unwrap();
+        let mut old = Journal::open(&expired.path().join("expired.sqlite")).unwrap();
+        old.reserve(scope.offer.journal_offer()).unwrap();
+        old.register_guest_receipt_verifier(
+            &scope,
+            scope.verifier(&credential),
+            now - MAX_RECOVERY_MILLIS - 10,
+            now - 10,
+        )
+        .unwrap();
+        assert!(old
+            .guest_recovery_scope_for_targeted_tls(
+                scope.exact_transfer_id(),
+                scope.sender_key(),
+                scope.receiver_key(),
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn bearer_credential_is_random_nonzero_and_never_prints_secret_bytes() {
         let first = GuestRecoveryCredential::generate().unwrap();
         let second = GuestRecoveryCredential::generate().unwrap();
