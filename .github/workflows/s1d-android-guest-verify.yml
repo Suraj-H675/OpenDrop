@@ -117,6 +117,10 @@ jobs:
           set -euo pipefail
           library="target/aarch64-linux-android/release/libopendrop_android_sender.so"
           test -s "$library"
+          # Linkage-only contract; this is NOT an Android device JNI call.
+          readelf --wide --syms "$library" | grep -F 'Java_org_opendrop_app_GuestNative_sendOne'
+          readelf --wide --syms "$library" | grep -F 'Java_org_opendrop_app_GuestNative_recoverOne'
+          readelf --wide --syms "$library" | grep -F 'Java_org_opendrop_app_GuestNative_cancel'
           mkdir -p apps/android/build/generated/opendrop-jni/arm64-v8a
           cp "$library" apps/android/build/generated/opendrop-jni/arm64-v8a/libopendrop_android_guest.so
           file "$library"
@@ -140,7 +144,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          apk="apps/android/build/outputs/apk/debug/android-debug.apk"
+          apk="apps/android/build/outputs/apk/debug/OpenDropAndroid-debug.apk"
           test -s "$apk"
           unzip -l "$apk" | grep -F 'lib/arm64-v8a/libopendrop_android_guest.so'
           echo 'HOSTED ONLY: debug source build; no emulator, phone or Keystore attestation.'
