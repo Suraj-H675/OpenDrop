@@ -40,10 +40,10 @@ fn check_active(active: &AtomicBool, deadline: Instant) -> Result<()> {
 
 /// A per-operation deadline that survives short socket timeouts and
 /// fragmentation; the Android transport must configure 250ms SO_RCVTIMEO.
-struct DeadlineIo<'a, T> {
-    inner: &'a mut T,
-    deadline: Instant,
-    active: &'a AtomicBool,
+pub(crate) struct DeadlineIo<'a, T> {
+    pub(crate) inner: &'a mut T,
+    pub(crate) deadline: Instant,
+    pub(crate) active: &'a AtomicBool,
 }
 
 impl<T: Read> Read for DeadlineIo<'_, T> {
@@ -91,7 +91,7 @@ impl<T: Write> Write for DeadlineIo<'_, T> {
     }
 }
 
-fn deadline(now: Duration) -> Result<Instant> {
+pub(crate) fn deadline(now: Duration) -> Result<Instant> {
     Instant::now()
         .checked_add(now)
         .ok_or(SendError::Protocol("deadline overflow"))
@@ -255,9 +255,15 @@ pub fn connect_guest<T: Read + Write>(
             deadline: handshake_deadline,
             active: active.as_ref(),
         };
-        connection
-            .complete_io(&mut io)
-            .map_err(|_| SendError::Protocol("strict mutual raw-key TLS failed"))?;
+        match connection.complete_io(&mut io) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(_) => return Err(SendError::Protocol("strict mutual raw-key TLS failed")),
+        }
     }
     if connection.is_handshaking() {
         return Err(SendError::Protocol("TLS handshake budget exceeded"));
@@ -433,5 +439,77 @@ impl<T: Read + Write> AuthenticatedSender<T> {
             }
             _ => Err(SendError::UncertainCompletion),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uri_source_unknown_size_hashes_exact_bytes_without_buffering_whole_file() {
+        let data: Vec<u8> = (0..109_007).map(|i| (i % 251) as u8).collect();
+        let (size, hash) = prehash_source(&mut io::Cursor::new(&data), None).unwrap();
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(hash.as_str(), hex_sha(&Sha256::digest(&data)));
+        let error = prehash_source(&mut io::Cursor::new(&data), Some(size + 1)).unwrap_err();
+        assert!(matches!(error, SendError::Protocol(_)));
+    }
+
+    struct RevokedUriReader;
+    impl Read for RevokedUriReader {
+        fn read(&mut self, _bytes: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "content URI revoked",
+            ))
+        }
+    }
+
+    #[test]
+    fn revoked_uri_permission_fails_closed_without_an_offer() {
+        assert!(matches!(
+            prehash_source(&mut RevokedUriReader, None),
+            Err(SendError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    struct UnlimitedUri {
+        remaining: u64,
+    }
+    impl Read for UnlimitedUri {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            let take = bytes.len().min(self.remaining as usize);
+            bytes[..take].fill(0x66);
+            self.remaining -= take as u64;
+            Ok(take)
+        }
+    }
+
+    #[test]
+    fn unknown_size_stream_cannot_bypass_wire_64mib_limit() {
+        let mut source = UnlimitedUri {
+            remaining: wire::MAX_FILE + 1,
+        };
+        assert!(matches!(
+            prehash_source(&mut source, None),
+            Err(SendError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn cancelled_transport_does_not_read_any_more_bytes() {
+        let live = AtomicBool::new(false);
+        let mut underlying = io::Cursor::new(b"secret".to_vec());
+        let mut guarded = DeadlineIo {
+            inner: &mut underlying,
+            deadline: deadline(Duration::from_secs(1)).unwrap(),
+            active: &live,
+        };
+        assert_eq!(
+            guarded.read(&mut [0; 4]).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(underlying.position(), 0);
     }
 }

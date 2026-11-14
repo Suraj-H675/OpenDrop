@@ -101,7 +101,13 @@ class AndroidGuestBridge(
                 capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
             val links = manager.getLinkProperties(network) ?: return@filter false
             hasLanTransport && !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
-                links.routes.any { it.matches(peer) && !it.isDefaultRoute && !it.hasGateway() }
+                // RouteInfo.hasGateway() is API 29; use the API 21
+                // gateway property for every supported Android version.
+                // An absent/unspecified gateway is directly connected.
+                links.routes.any { route ->
+                    route.matches(peer) && !route.isDefaultRoute &&
+                        (route.gateway == null || route.gateway.isAnyLocalAddress)
+                }
         }
         require(available.size == 1) {
             "No unambiguous Wi-Fi/Ethernet route directly to this peer; cellular fallback disabled"

@@ -1,6 +1,9 @@
 //! Android's receipt-only sender recovery: a single encrypted-at-rest scoped
 //! credential, not permission to repeat an uncertain file upload.
-use crate::{Result, SendError};
+use crate::{
+    sender::{deadline, DeadlineIo},
+    Result, SendError,
+};
 use opendrop_core::guest::{
     GuestHello, GuestSpkiFingerprint, GuestTranscript, P256Spki, TlsSide, TransferSide, HELLO_LEN,
 };
@@ -183,12 +186,25 @@ pub fn recover_committed<T: Read + Write>(
         return Err(SendError::Protocol("recovery identity, clock or lifecycle"));
     }
     let client = identity.new_hello(TlsSide::Client, TransferSide::Sender)?;
-    transport.write_all(b"ODGR")?;
-    transport.write_all(recovery.offer.id.as_str().as_bytes())?;
-    transport.write_all(&client.encoded())?;
-    transport.flush()?;
+    let first = deadline(TICK_LIMIT)?;
+    {
+        let mut guarded = DeadlineIo {
+            inner: &mut transport,
+            deadline: first,
+            active: active.as_ref(),
+        };
+        guarded.write_all(b"ODGR")?;
+        guarded.write_all(recovery.offer.id.as_str().as_bytes())?;
+        guarded.write_all(&client.encoded())?;
+        guarded.flush()?;
+    }
     let mut bytes = [0u8; HELLO_LEN];
-    transport.read_exact(&mut bytes)?;
+    DeadlineIo {
+        inner: &mut transport,
+        deadline: first,
+        active: active.as_ref(),
+    }
+    .read_exact(&mut bytes)?;
     let server = GuestHello::parse(&bytes)?;
     if server.public_key() != &recovery.receiver_spki
         || server.device_id() != &recovery.receiver_device
@@ -212,7 +228,11 @@ pub fn recover_committed<T: Read + Write>(
         if !connection.is_handshaking() {
             break;
         }
-        match connection.complete_io(&mut transport) {
+        match connection.complete_io(&mut DeadlineIo {
+            inner: &mut transport,
+            deadline: first,
+            active: active.as_ref(),
+        }) {
             Ok(_) => {}
             Err(error)
                 if matches!(
@@ -225,7 +245,8 @@ pub fn recover_committed<T: Read + Write>(
     if connection.is_handshaking() {
         return Err(SendError::Protocol("recovery handshake budget"));
     }
-    let verified = VerifiedReceiptOnlyTls::from_completed_client(&connection, transcript, active)?;
+    let verified =
+        VerifiedReceiptOnlyTls::from_completed_client(&connection, transcript, active.clone())?;
     if !verified.is_active()
         || verified.peer_public_key() != &recovery.receiver_spki
         || verified.local_public_key() != identity.public_key()
@@ -237,10 +258,18 @@ pub fn recover_committed<T: Read + Write>(
         recovery.offer.clone(),
         recovery.credential.clone(),
     ))
-    .write_to(&mut tls)?;
+    .write_to(&mut DeadlineIo {
+        inner: &mut tls,
+        deadline: deadline(TICK_LIMIT)?,
+        active: active.as_ref(),
+    })?;
     tls.flush()?;
-    let received = Frame::read_from(&mut tls)
-        .map_err(|_| SendError::Protocol("no committed recovery receipt"))?;
+    let received = Frame::read_from(&mut DeadlineIo {
+        inner: &mut tls,
+        deadline: deadline(TICK_LIMIT)?,
+        active: active.as_ref(),
+    })
+    .map_err(|_| SendError::Protocol("no committed recovery receipt"))?;
     match received {
         Frame::Control(Control::Complete(receipt))
             if verified.is_active()
