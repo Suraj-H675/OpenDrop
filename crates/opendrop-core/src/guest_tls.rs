@@ -1159,4 +1159,29 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, confirmation_mac(&[3; 32], &[5; 32], TlsSide::Client));
     }
+
+    #[test]
+    fn portable_role_hmac_vectors_reject_reflection_and_role_substitution() {
+        // Exact synthetic inputs shared with Android Keystore and Windows CNG
+        // conformance tests. This does not replace a real TLS exporter test.
+        let digest_hex = "3f8db22cd9ceeb9c016cbaa1b8db2d2a8c332ef0f75dacfd306aa8b6cbcccd1d";
+        let mut digest = [0u8; 32];
+        for (idx, bytes) in digest_hex.as_bytes().chunks_exact(2).enumerate() {
+            digest[idx] = u8::from_str_radix(std::str::from_utf8(bytes).unwrap(), 16).unwrap();
+        }
+        let proof_key = std::array::from_fn(|idx| idx as u8);
+        let as_hex = |tag: [u8; 32]| {
+            tag.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(
+            as_hex(confirmation_mac(&proof_key, &digest, TlsSide::Client)),
+            "d8aa4d659cd59194bbbf8d1df632757dd849d4daad791329c15433ab9e729378"
+        );
+        assert_eq!(
+            as_hex(confirmation_mac(&proof_key, &digest, TlsSide::Server)),
+            "42bf49d8e2362912e3945fa4d0320e5596bb1cd00cdf89ec84153f6a89cc0f75"
+        );
+    }
 }

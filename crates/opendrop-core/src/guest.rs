@@ -535,4 +535,61 @@ mod tests {
         );
         assert_ne!(spki(3).fingerprint(), spki(4).fingerprint());
     }
+
+    #[test]
+    fn portable_p256_identity_and_guest_transcript_vectors_match_android_windows_contract() {
+        // Public deterministic vectors for Android Keystore, Windows CNG and
+        // Linux PKCS#11 interop; scalar 1/2 MUST NEVER be installation keys.
+        let from_hex = |text: &str| -> Vec<u8> {
+            text.as_bytes()
+                .chunks_exact(2)
+                .map(|bytes| u8::from_str_radix(std::str::from_utf8(bytes).unwrap(), 16).unwrap())
+                .collect()
+        };
+        let client_key = P256Spki::from_canonical_der(&from_hex(concat!(
+            "3059301306072a8648ce3d020106082a8648ce3d03010703420004",
+            "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296",
+            "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+        )))
+        .unwrap();
+        let server_key = P256Spki::from_canonical_der(&from_hex(concat!(
+            "3059301306072a8648ce3d020106082a8648ce3d03010703420004",
+            "7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978",
+            "07775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1",
+        )))
+        .unwrap();
+        assert_eq!(
+            client_key.fingerprint().to_hex(),
+            "5cd252fb0ce8932436faf8ccd1040981b89ee4ad6b9fe9e2a2b7e71aacb27cd3"
+        );
+        assert_eq!(
+            server_key.fingerprint().to_hex(),
+            "dc0ce633dbcc913dafafa4b89ac44d8ce683fdfc3f60c8bdf21213b9f2b534ba"
+        );
+        let client = GuestHello {
+            device: DeviceId::parse(&"a".repeat(32)).unwrap(),
+            spki: client_key,
+            nonce: std::array::from_fn(|i| i as u8),
+            tls_side: TlsSide::Client,
+            transfer_side: TransferSide::Sender,
+        };
+        let server = GuestHello {
+            device: DeviceId::parse(&"b".repeat(32)).unwrap(),
+            spki: server_key,
+            nonce: std::array::from_fn(|i| (i + 32) as u8),
+            tls_side: TlsSide::Server,
+            transfer_side: TransferSide::Receiver,
+        };
+        assert_eq!(client.encoded().len(), HELLO_LEN);
+        assert_eq!(server.encoded().len(), HELLO_LEN);
+        let transcript = GuestTranscript::new(client, server).unwrap();
+        assert_eq!(
+            transcript
+                .canonical_digest(0x1301, 0x0017)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "3f8db22cd9ceeb9c016cbaa1b8db2d2a8c332ef0f75dacfd306aa8b6cbcccd1d"
+        );
+    }
 }
