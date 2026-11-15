@@ -16,6 +16,9 @@ import java.security.Signature
  */
 class GuestRuntimeInstrumentation : Instrumentation() {
     private var phase = ""
+    // Public test-only checkpoints permit precise runtime diagnosis without
+    // exposing device identifiers, URI metadata, credential bytes or logs.
+    private var checkpoint = "instrumentation-start"
     override fun onCreate(arguments: Bundle?) {
         super.onCreate(arguments)
         phase = arguments?.getString("phase") ?: "missing"
@@ -36,6 +39,7 @@ class GuestRuntimeInstrumentation : Instrumentation() {
             val fixedAssertion = (problem as? AssertionError)?.message?.take(80)
             output.putString("stream",
                 "S1E_ANDROID_ART_FAIL:" + phase + ":" + problem.javaClass.simpleName +
+                    ":stage=" + checkpoint +
                     (if (fixedAssertion != null) ":" + fixedAssertion else ""))
             finish(Activity.RESULT_CANCELED, output)
         }
@@ -49,12 +53,14 @@ class GuestRuntimeInstrumentation : Instrumentation() {
 
     private fun prepare() {
         val app = targetContext
+        checkpoint = "create-android-keystore-identity"
         val identity = GuestIdentity(app)
         val id = identity.installationId()
         val spki = identity.publicSpki()
         requireTest(id.matches(Regex("[0-9a-f]{32}")) && spki.size == 91,
             "canonical persistent P256")
         val challenge = "S1E/AndroidKeyStore/Runtime".toByteArray()
+        checkpoint = "sign-android-keystore-challenge"
         val signed = identity.signP256Sha256(challenge)
         val publicKey = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
             .getCertificate("opendrop.s1.identity.p256.v1").publicKey
@@ -67,7 +73,9 @@ class GuestRuntimeInstrumentation : Instrumentation() {
 
         val launch = Intent(app, ShareIngressActivity::class.java)
             .setAction(Intent.ACTION_MAIN).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        checkpoint = "start-real-activity"
         val activity = startActivitySync(launch) as ShareIngressActivity
+        checkpoint = "invoke-production-jni-and-rust-keystore-proof"
         val owner = AndroidGuestBridge(activity, emptyList())
         requireTest(GuestNative.identitySelfTest(owner) == sha(spki),
             "real JNI Rust P256 signer and SPKI")
@@ -76,6 +84,7 @@ class GuestRuntimeInstrumentation : Instrumentation() {
         val uris = listOf("first", "second", "denied").map {
             Uri.parse("content://org.opendrop.app.test.fixtures/" + it)
         }
+        checkpoint = "grant-test-provider-uri"
         uris.forEach {
             context.grantUriPermission(app.packageName, it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
@@ -83,9 +92,11 @@ class GuestRuntimeInstrumentation : Instrumentation() {
             type = "text/plain"; putExtra(Intent.EXTRA_STREAM, uris[0])
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
+        checkpoint = "parse-single-provider-uri"
         val source = ShareSource.parse(one, app.contentResolver)
         requireTest(source.size == 1 && source[0].name == "first.txt" &&
             source[0].declaredSize == null, "unknown-length URI metadata")
+        checkpoint = "read-real-provider-pipe"
         ShareSource.openForRead(app.contentResolver, source[0]).use {
             requireTest(String(it.readBytes()) == "hosted ContentResolver pipe #1",
                 "test provider pipe read")
@@ -95,6 +106,7 @@ class GuestRuntimeInstrumentation : Instrumentation() {
             putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris.take(2)))
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
+        checkpoint = "parse-multiple-provider-uris"
         val batch = ShareSource.parse(many, app.contentResolver)
         requireTest(batch.size == 2 && batch[1].name == "second.txt",
             "ACTION_SEND_MULTIPLE")
@@ -108,6 +120,7 @@ class GuestRuntimeInstrumentation : Instrumentation() {
                 SharedFile(uris[2], "denied.txt", null, "text/plain")).use { it.read() }
         }.isFailure, "source denied")
         val receiver = AndroidGuestBridge(activity, batch)
+        checkpoint = "read-stream-with-android-bridge"
         receiver.openSource(1)
         requireTest(receiver.sourceChunk(32)?.isNotEmpty() == true,
             "actual bridge ContentResolver stream")
@@ -115,6 +128,7 @@ class GuestRuntimeInstrumentation : Instrumentation() {
         receiver.cancel()
         requireTest(runCatching { receiver.openSource(0) }.isFailure,
             "cancelled foreground must reject reopening")
+        checkpoint = "revoke-test-provider-uri"
         uris.forEach {
             context.revokeUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
@@ -123,6 +137,7 @@ class GuestRuntimeInstrumentation : Instrumentation() {
         }.isFailure, "revoked URI access must fail")
 
         val recordId = "abcdef0123456789abcdef0123456789"
+        checkpoint = "seal-android-keystore-recovery"
         val disposable = ByteArray(32) { (it + 1).toByte() }
         val store = ProtectedReceiptStore(app)
         requireTest(store.sealRecovery(recordId,
@@ -133,6 +148,7 @@ class GuestRuntimeInstrumentation : Instrumentation() {
         requireTest(app.getSharedPreferences("s1e_runtime", Context.MODE_PRIVATE).edit()
             .putString("id", id).putString("spki", sha(spki))
             .putInt("pid", Process.myPid()).commit(), "persist public-only restart record")
+        checkpoint = "finish-test-activity"
         activity.runOnUiThread { activity.finish() }
     }
 
