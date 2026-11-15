@@ -64,6 +64,17 @@ jobs:
         uses: gradle/actions/setup-gradle@0b6dd653ba04f4f93bf581ec31e66cbd7dcb644d
         with:
           gradle-version: '8.11.1'
+      - name: Preflight KVM acceleration on disposable GitHub runner only
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -c /dev/kvm
+          # Some GitHub Ubuntu images provide a usable KVM device but do not
+          # run the udev daemon; udevadm --reload-rules fails there. Change
+          # only this isolated runner's device mode, never the owner host.
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          ls -l /dev/kvm
       - name: Cross compile actual Android JNI for arm64 and emulator x86-64
         shell: bash
         run: |
@@ -104,20 +115,6 @@ jobs:
           unzip -l "$apk" | grep -F 'lib/arm64-v8a/libopendrop_android_guest.so'
           unzip -l "$apk" | grep -F 'lib/x86_64/libopendrop_android_guest.so'
           unzip -l "$testapk" | grep -F 'classes.dex'
-      - name: Enable KVM acceleration on disposable GitHub runner only
-        shell: bash
-        run: |
-          set -euo pipefail
-          # As documented by reactivecircus/android-emulator-runner, standard
-          # hosted Ubuntu may expose /dev/kvm but restrict its group permissions.
-          # The prior run timed out booting because user access was denied.
-          test -c /dev/kvm
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          test -r /dev/kvm
-          test -w /dev/kvm
-          ls -l /dev/kvm
       - name: Disposable x86-64 Android API35 emulator with real ART instrumentation
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # reviewed v2.38.0
         with:
