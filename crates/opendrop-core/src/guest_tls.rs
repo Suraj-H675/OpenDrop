@@ -5,9 +5,8 @@
 //!
 //! Platform P-256 signers never export private key material. TLS signatures
 //! are DER ECDSA-SHA256 signatures over the rustls-provided TLS message.
-//! Android Keystore, Windows CNG and Linux OS providers are NOT implemented
-//! here; the shared signer contract compiles portably and fails closed without
-//! one of those reviewed native adapters.
+//! Android Keystore and Windows CNG live in platform adapters; shared TLS
+//! has no software signing fallback and fails closed without a native signer.
 
 use crate::guest::{
     GuestAdmissionPermit, GuestHello, GuestSpkiFingerprint, GuestTranscript, P256Spki, TlsSide,

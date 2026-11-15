@@ -478,6 +478,28 @@ fn build_identity(port: &AndroidPort) -> Result<LocalGuestIdentity> {
     )?)
 }
 
+/// Runtime probe available in the normal APK, not a fake-key hook. It
+/// exercises the actual Java AndroidKeyStore private signing operation,
+/// the shared Rust NativeP256Signer adapter and ring's P-256 DER verifier.
+/// Returns only the SHA256 of the *public* canonical SPKI.
+#[no_mangle]
+pub extern "system" fn Java_org_opendrop_app_GuestNative_identitySelfTest(
+    mut env: JNIEnv,
+    _receiver: JClass,
+    bridge: JObject,
+) -> jstring {
+    let result = (|| -> Result<String> {
+        let port = AndroidPort::new(&mut env, bridge)?;
+        let identity = build_identity(&port)?;
+        Ok(identity.public_key().fingerprint().to_hex())
+    })();
+    let message =
+        result.unwrap_or_else(|_| "ERROR: AndroidKeyStore P-256 identity unavailable".to_owned());
+    env.new_string(message)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
 fn send_one(
     port: &AndroidPort,
     index: jint,

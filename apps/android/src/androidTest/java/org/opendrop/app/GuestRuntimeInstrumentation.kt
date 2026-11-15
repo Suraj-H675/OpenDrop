@@ -1,0 +1,169 @@
+package org.opendrop.app
+
+import android.app.Activity
+import android.app.Instrumentation
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.os.Process
+import java.security.KeyStore
+import java.security.MessageDigest
+import java.security.Signature
+
+/** Real Android ART instrumentation. Invoke twice with a force-stop between:
+ * phase=prepare then phase=restart. Never substitutes fake JNI or keys.
+ */
+class GuestRuntimeInstrumentation : Instrumentation() {
+    private var phase = ""
+    override fun onCreate(arguments: Bundle?) {
+        super.onCreate(arguments)
+        phase = arguments?.getString("phase") ?: "missing"
+        start()
+    }
+    override fun onStart() {
+        val output = Bundle()
+        try {
+            when (phase) {
+                "prepare" -> prepare()
+                "restart" -> verifyRestart()
+                else -> error("unknown instrumentation phase")
+            }
+            output.putString("stream", "S1E_ANDROID_ART_PASS:" + phase)
+            finish(Activity.RESULT_OK, output)
+        } catch (problem: Throwable) {
+            // No private keys, tokens, URIs or recovered bytes in output.
+            output.putString("stream",
+                "S1E_ANDROID_ART_FAIL:" + phase + ":" + problem.javaClass.simpleName)
+            finish(Activity.RESULT_CANCELED, output)
+        }
+    }
+    private fun requireTest(yes: Boolean, what: String) {
+        if (!yes) throw AssertionError(what)
+    }
+    private fun sha(data: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(data)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
+    private fun prepare() {
+        val app = targetContext
+        val identity = GuestIdentity(app)
+        val id = identity.installationId()
+        val spki = identity.publicSpki()
+        requireTest(id.matches(Regex("[0-9a-f]{32}")) && spki.size == 91,
+            "canonical persistent P256")
+        val challenge = "S1E/AndroidKeyStore/Runtime".toByteArray()
+        val signed = identity.signP256Sha256(challenge)
+        val publicKey = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            .getCertificate("opendrop.s1.identity.p256.v1").publicKey
+        requireTest(Signature.getInstance("SHA256withECDSA").run {
+            initVerify(publicKey); update(challenge); verify(signed)
+        }, "AndroidKeyStore ECDSA")
+        requireTest(!Signature.getInstance("SHA256withECDSA").run {
+            initVerify(publicKey); update("tamper".toByteArray()); verify(signed)
+        }, "signature tampering rejected")
+
+        val launch = Intent(app, ShareIngressActivity::class.java)
+            .setAction(Intent.ACTION_MAIN).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val activity = startActivitySync(launch) as ShareIngressActivity
+        val owner = AndroidGuestBridge(activity, emptyList())
+        requireTest(GuestNative.identitySelfTest(owner) == sha(spki),
+            "real JNI Rust P256 signer and SPKI")
+        GuestNative.cancel()
+
+        val uris = listOf("first", "second", "denied").map {
+            Uri.parse("content://org.opendrop.app.test.fixtures/" + it)
+        }
+        uris.forEach {
+            context.grantUriPermission(app.packageName, it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val one = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"; putExtra(Intent.EXTRA_STREAM, uris[0])
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val source = ShareSource.parse(one, app.contentResolver)
+        requireTest(source.size == 1 && source[0].name == "first.txt" &&
+            source[0].declaredSize == null, "unknown-length URI metadata")
+        ShareSource.openForRead(app.contentResolver, source[0]).use {
+            requireTest(String(it.readBytes()) == "hosted ContentResolver pipe #1",
+                "test provider pipe read")
+        }
+        val many = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+            type = "text/plain"
+            putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris.take(2)))
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val batch = ShareSource.parse(many, app.contentResolver)
+        requireTest(batch.size == 2 && batch[1].name == "second.txt",
+            "ACTION_SEND_MULTIPLE")
+        requireTest(runCatching {
+            ShareSource.parse(Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"; putExtra(Intent.EXTRA_STREAM, uris[0])
+            }, app.contentResolver)
+        }.isFailure, "missing URI grant flag")
+        requireTest(runCatching {
+            ShareSource.openForRead(app.contentResolver,
+                SharedFile(uris[2], "denied.txt", null, "text/plain")).use { it.read() }
+        }.isFailure, "source denied")
+        val receiver = AndroidGuestBridge(activity, batch)
+        receiver.openSource(1)
+        requireTest(receiver.sourceChunk(32)?.isNotEmpty() == true,
+            "actual bridge ContentResolver stream")
+        receiver.closeSource()
+        receiver.cancel()
+        requireTest(runCatching { receiver.openSource(0) }.isFailure,
+            "cancelled foreground must reject reopening")
+        uris.forEach {
+            context.revokeUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        requireTest(runCatching {
+            ShareSource.openForRead(app.contentResolver, source[0]).use { it.read() }
+        }.isFailure, "revoked URI access must fail")
+
+        val recordId = "abcdef0123456789abcdef0123456789"
+        val disposable = ByteArray(32) { (it + 1).toByte() }
+        val store = ProtectedReceiptStore(app)
+        requireTest(store.sealRecovery(recordId,
+            System.currentTimeMillis() + 600_000L, disposable), "Keystore AES-GCM commit")
+        requireTest(disposable.all { it == 0.toByte() }, "plaintext wipe after seal")
+        requireTest(store.latestRecovery() == recordId &&
+            store.unsealRecovery(recordId)?.size == 32, "encrypted recovery")
+        requireTest(app.getSharedPreferences("s1e_runtime", Context.MODE_PRIVATE).edit()
+            .putString("id", id).putString("spki", sha(spki))
+            .putInt("pid", Process.myPid()).commit(), "persist public-only restart record")
+        activity.runOnUiThread { activity.finish() }
+    }
+
+    private fun verifyRestart() {
+        val app = targetContext
+        val state = app.getSharedPreferences("s1e_runtime", Context.MODE_PRIVATE)
+        requireTest(state.getInt("pid", -1) > 0 &&
+            state.getInt("pid", -1) != Process.myPid(), "no actual process restart")
+        val identity = GuestIdentity(app)
+        requireTest(identity.installationId() == state.getString("id", null) &&
+            sha(identity.publicSpki()) == state.getString("spki", null),
+            "stable AndroidKeyStore identity after restart")
+        val recordId = "abcdef0123456789abcdef0123456789"
+        val receipts = ProtectedReceiptStore(app)
+        val plaintext = receipts.unsealRecovery(recordId)
+        requireTest(plaintext != null &&
+            plaintext.contentEquals(ByteArray(32) { (it + 1).toByte() }),
+            "AES-GCM recovery after process restart")
+        plaintext?.fill(0)
+        val prefs = app.getSharedPreferences("guest_receipts", Context.MODE_PRIVATE)
+        val old = prefs.getString("sealed:$recordId", null) ?: error("missing ciphertext")
+        requireTest(prefs.edit().putString("sealed:$recordId",
+            (if (old[0] == 'A') 'B' else 'A') + old.drop(1)).commit(),
+            "test-only corruption")
+        requireTest(runCatching { receipts.unsealRecovery(recordId) }.isFailure,
+            "tampered AES-GCM must fail")
+        requireTest(receipts.clearRecovery(recordId) && receipts.latestRecovery() == null,
+            "protected record cleanup")
+        // Deliberately delete test-installed identity LAST; production code
+        // must refuse to silently reprovision an established key.
+        KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            .deleteEntry("opendrop.s1.identity.p256.v1")
+        requireTest(runCatching { GuestIdentity(app).publicSpki() }.isFailure,
+            "missing established key silently replaced")
+    }
+}

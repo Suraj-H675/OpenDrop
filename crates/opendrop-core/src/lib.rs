@@ -12,6 +12,8 @@ pub mod identity;
 pub mod journal;
 pub mod policy;
 pub mod receiver;
+#[cfg(windows)]
+pub mod windows_cng;
 pub mod wire;
 
 #[cfg(test)]

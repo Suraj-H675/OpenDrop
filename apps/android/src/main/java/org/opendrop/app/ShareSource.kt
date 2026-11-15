@@ -42,6 +42,9 @@ internal object ShareSource {
             require(bytes.isNotEmpty() && bytes.size <= MAX_TEXT) { "Text share is too large" }
             return listOf(SharedFile(null, "Shared text.txt", bytes.size.toLong(), "text/plain", bytes))
         }
+        require(intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0) {
+            "Sending app did not grant scoped read permission"
+        }
         require(uris.isNotEmpty() && uris.size <= MAX_ITEMS) {
             "Select between 1 and 16 files"
         }

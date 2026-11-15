@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Test-only provider; never packaged in the production APK. -->
+        <provider
+            android:name="org.opendrop.app.GuestFixtureProvider"
+            android:authorities="org.opendrop.app.test.fixtures"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+    </application>
+</manifest>

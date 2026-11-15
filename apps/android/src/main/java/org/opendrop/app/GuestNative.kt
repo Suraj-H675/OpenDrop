@@ -22,5 +22,8 @@ class GuestNative private constructor() {
         ): String
 
         @JvmStatic external fun cancel(): Unit
+
+        /** Real JNI/Rust+AndroidKeyStore signature proof; never test-only key. */
+        @JvmStatic external fun identitySelfTest(bridge: AndroidGuestBridge): String
     }
 }
