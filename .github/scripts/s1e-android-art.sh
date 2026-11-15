@@ -54,10 +54,15 @@ for phase in prepare restart; do
     echo "Actual ART instrumentation $phase did not assert PASS" >&2
     exit 1
   }
-  grep -Fq 'INSTRUMENTATION_CODE: -1' <<< "$result" || {
+  # Android's 'am instrument -w' prints only the stream string when the
+  # instrumentation supplies Bundle["stream"]. The prior hosted run emitted
+  # S1E_ANDROID_ART_PASS:prepare after all prepare assertions, but no
+  # INSTRUMENTATION_CODE line. Still reject any reported non-success code,
+  # crash or explicit failure marker; rely on the *test's* exact stage PASS.
+  if grep -Eq 'INSTRUMENTATION_CODE: (0|[1-9][0-9]*)|INSTRUMENTATION_RESULT: shortMsg=|S1E_ANDROID_ART_FAIL:' <<< "$result"; then
     dump_crash_evidence
-    echo "Actual ART instrumentation $phase did not return RESULT_OK" >&2
+    echo "Actual ART instrumentation $phase reported failure despite a PASS marker" >&2
     exit 1
-  }
+  fi
 done
 echo 'HOSTED ART/P256/URI/AES-GCM: two real test phases passed; no personal device or attestation claim.'
