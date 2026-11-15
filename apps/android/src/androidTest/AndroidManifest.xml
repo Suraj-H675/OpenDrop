@@ -7,5 +7,12 @@
             android:authorities="org.opendrop.app.test.fixtures"
             android:exported="false"
             android:grantUriPermissions="true" />
+        <!-- An external test-only provider, running in the fixture APK UID,
+             issues and revokes real Android URI grants for the target app.
+             The production OpenDrop APK never contains either provider. -->
+        <provider
+            android:name="org.opendrop.app.GuestGrantIssuerProvider"
+            android:authorities="org.opendrop.app.test.grants"
+            android:exported="true" />
     </application>
 </manifest>

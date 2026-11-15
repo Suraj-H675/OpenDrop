@@ -85,9 +85,9 @@ class GuestRuntimeInstrumentation : Instrumentation() {
             Uri.parse("content://org.opendrop.app.test.fixtures/" + it)
         }
         checkpoint = "grant-test-provider-uri"
-        uris.forEach {
-            context.grantUriPermission(app.packageName, it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
+        val issuer = Uri.parse("content://org.opendrop.app.test.grants")
+        requireTest(app.contentResolver.call(issuer, "grant", null, null)
+            ?.getBoolean("issued") == true, "fixture owner granted scoped URI access")
         val one = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"; putExtra(Intent.EXTRA_STREAM, uris[0])
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -129,9 +129,8 @@ class GuestRuntimeInstrumentation : Instrumentation() {
         requireTest(runCatching { receiver.openSource(0) }.isFailure,
             "cancelled foreground must reject reopening")
         checkpoint = "revoke-test-provider-uri"
-        uris.forEach {
-            context.revokeUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
+        requireTest(app.contentResolver.call(issuer, "revoke", null, null)
+            ?.getBoolean("issued") == true, "fixture owner revoked scoped URI access")
         requireTest(runCatching {
             ShareSource.openForRead(app.contentResolver, source[0]).use { it.read() }
         }.isFailure, "revoked URI access must fail")
