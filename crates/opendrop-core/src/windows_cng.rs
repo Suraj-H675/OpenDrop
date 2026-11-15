@@ -89,6 +89,10 @@ extern "system" {
 }
 
 const SILENT: u32 = 0x40;
+// NCryptSetProperty on a persistent key must explicitly request persisted
+// storage. Without NCRYPT_PERSIST_FLAG, provider defaults might look safe in
+// the current process while the explicit policy is not durable on reopen.
+const PERSIST_PROPERTY: u32 = 0x8000_0000;
 const HARDWARE: u32 = 0x1;
 const SOFTWARE: u32 = 0x2;
 const ALLOW_SIGN: u32 = 0x2;
@@ -369,7 +373,7 @@ impl WindowsCngSigner {
                 wide("Export Policy").as_ptr(),
                 (&no_export as *const u32).cast::<u8>(),
                 4,
-                0,
+                PERSIST_PROPERTY,
             )
         })?;
         let sign_only = ALLOW_SIGN;
@@ -379,7 +383,7 @@ impl WindowsCngSigner {
                 wide("Key Usage").as_ptr(),
                 (&sign_only as *const u32).cast::<u8>(),
                 4,
-                0,
+                PERSIST_PROPERTY,
             )
         })?;
         valid(unsafe { NCryptFinalizeKey(key.0, SILENT) })?;
@@ -542,6 +546,13 @@ mod tests {
             WindowsCngSigner::open_named(ProviderClass::WindowsUserProtected, &name).unwrap();
         assert_eq!(reopened.canonical_public_spki_der().unwrap(), stable_spki);
         assert_eq!(reopened.installation_device_id().unwrap(), device_id);
+        {
+            let state = reopened.handles.lock().unwrap();
+            // Explicit provisioning policy must survive closing/reopening
+            // the persisted key, not just appear safe on its original handle.
+            assert_eq!(property_u32(state.key.0, "Export Policy").unwrap(), 0);
+            assert_eq!(property_u32(state.key.0, "Key Usage").unwrap(), ALLOW_SIGN);
+        }
         remove_test_key(reopened);
         assert!(WindowsCngSigner::open_named(ProviderClass::WindowsUserProtected, &name).is_err());
     }

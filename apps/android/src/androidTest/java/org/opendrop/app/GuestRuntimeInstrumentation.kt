@@ -33,8 +33,10 @@ class GuestRuntimeInstrumentation : Instrumentation() {
             finish(Activity.RESULT_OK, output)
         } catch (problem: Throwable) {
             // No private keys, tokens, URIs or recovered bytes in output.
+            val fixedAssertion = (problem as? AssertionError)?.message?.take(80)
             output.putString("stream",
-                "S1E_ANDROID_ART_FAIL:" + phase + ":" + problem.javaClass.simpleName)
+                "S1E_ANDROID_ART_FAIL:" + phase + ":" + problem.javaClass.simpleName +
+                    (if (fixedAssertion != null) ":" + fixedAssertion else ""))
             finish(Activity.RESULT_CANCELED, output)
         }
     }

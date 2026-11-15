@@ -116,7 +116,10 @@ jobs:
           emulator-boot-timeout: 480
           disable-animations: true
           script: |
-            set -euo pipefail
+            # This action runs script with /bin/sh, not Bash. Keep strict
+            # POSIX errexit/undefined-variable handling without relying on
+            # the non-POSIX pipefail shell option.
+            set -eu
             apk=apps/android/build/outputs/apk/debug/OpenDropAndroid-debug.apk
             testapk=apps/android/build/outputs/apk/androidTest/debug/OpenDropAndroid-debug-androidTest.apk
             adb install -r "$apk"
@@ -126,7 +129,9 @@ jobs:
                 adb shell am force-stop org.opendrop.app
                 sleep 2
               fi
-              result="$(adb shell am instrument -w -e phase "$phase" org.opendrop.app.test/org.opendrop.app.GuestRuntimeInstrumentation)"
+              # Never let a blocked ART lifecycle or content provider consume
+              # the entire hosted job. Timeout is FAILURE, not test success.
+              result="$(timeout --signal=TERM --kill-after=5s 180s adb shell am instrument -w -e phase "$phase" org.opendrop.app.test/org.opendrop.app.GuestRuntimeInstrumentation)"
               printf '%s\n' "$result"
               printf '%s\n' "$result" | grep -F "S1E_ANDROID_ART_PASS:$phase"
               printf '%s\n' "$result" | grep -F 'INSTRUMENTATION_CODE: -1'
