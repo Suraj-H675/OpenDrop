@@ -49,6 +49,12 @@ impl DurablePublisher for RealFilePublisher {
             .map_err(|_| Error::Publication("short write".into()))?;
         file.sync_all()
             .map_err(|_| Error::Publication("sync failed".into()))?;
+        // This fixture exercises the PORTABLE journal commit/restart state
+        // machine, not the native Windows publisher. Rust's File::open on a
+        // directory cannot produce a flushable directory handle on Windows.
+        // Keep the POSIX parent-directory durability assertion for Linux,
+        // while Windows requires its own separately reviewed publisher.
+        #[cfg(not(windows))]
         fs::File::open(path.parent().unwrap())
             .and_then(|d| d.sync_all())
             .map_err(|_| Error::Publication("parent sync failed".into()))?;

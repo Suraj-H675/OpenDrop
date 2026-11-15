@@ -126,7 +126,7 @@ class GuestRuntimeInstrumentation : Instrumentation() {
         requireTest(store.sealRecovery(recordId,
             System.currentTimeMillis() + 600_000L, disposable), "Keystore AES-GCM commit")
         requireTest(disposable.all { it == 0.toByte() }, "plaintext wipe after seal")
-        requireTest(store.latestRecovery() == recordId &&
+        requireTest(store.latestPending() == recordId &&
             store.unsealRecovery(recordId)?.size == 32, "encrypted recovery")
         requireTest(app.getSharedPreferences("s1e_runtime", Context.MODE_PRIVATE).edit()
             .putString("id", id).putString("spki", sha(spki))
@@ -157,7 +157,7 @@ class GuestRuntimeInstrumentation : Instrumentation() {
             "test-only corruption")
         requireTest(runCatching { receipts.unsealRecovery(recordId) }.isFailure,
             "tampered AES-GCM must fail")
-        requireTest(receipts.clearRecovery(recordId) && receipts.latestRecovery() == null,
+        requireTest(receipts.clearRecovery(recordId) && receipts.latestPending() == null,
             "protected record cleanup")
         // Deliberately delete test-installed identity LAST; production code
         // must refuse to silently reprovision an established key.
