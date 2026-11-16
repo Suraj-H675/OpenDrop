@@ -12,6 +12,7 @@
 #[cfg(all(feature = "hosted-guest-fixture", not(debug_assertions)))]
 compile_error!("hosted-guest-fixture is forbidden for production release builds");
 
+mod ephemeral_guest;
 mod guest_signer;
 #[cfg(feature = "kwallet-gpg")]
 mod kwallet_gpg;

@@ -9,7 +9,9 @@ pub mod guest;
 pub mod guest_recovery;
 pub mod guest_tls;
 pub mod identity;
+pub mod identity_profile;
 pub mod journal;
+pub mod nearby;
 pub mod policy;
 pub mod receiver;
 #[cfg(windows)]

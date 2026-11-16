@@ -3,8 +3,9 @@
 //! persistent peer enrollment. Exact key pins come from a bounded UNTRUSTED
 //! introduction and only become human-verified after the SAS ceremony.
 //!
-//! Platform P-256 signers never export private key material. TLS signatures
-//! are DER ECDSA-SHA256 signatures over the rustls-provided TLS message.
+//! Protected persistent P-256 signers never export private key material.
+//! An explicitly selected one-time guest holds its key only in process RAM,
+//! NOT in an OS non-extractable keystore. TLS signatures are DER ECDSA-SHA256.
 //! Android Keystore and Windows CNG live in platform adapters; shared TLS
 //! has no software signing fallback and fails closed without a native signer.
 
@@ -41,9 +42,10 @@ const CONFIRM_MAGIC: &[u8; 4] = b"ODGC";
 pub const CONFIRM_LEN: usize = 38;
 const SAS_MODULUS: u64 = 10_000_000_000;
 
-/// Platform-specific trusted signing port; the key stays in the OS provider.
-/// The platform must return *canonical* P-256 SPKI and DER ECDSA-SHA256.
-/// No software/private-file fallback is constructed by this trait.
+/// Portable signing port. Persistent profiles must use verified native
+/// protected providers; the separately authorized one-time guest signer is
+/// strictly volatile. The implementation must return *canonical* P-256 SPKI
+/// and DER ECDSA-SHA256. No plaintext persistent-key fallback is allowed.
 pub trait NativeP256Signer: fmt::Debug + Send + Sync {
     fn canonical_public_spki_der(&self) -> Result<Vec<u8>, Error>;
     fn sign_ecdsa_p256_sha256_der(&self, message: &[u8]) -> Result<Vec<u8>, Error>;

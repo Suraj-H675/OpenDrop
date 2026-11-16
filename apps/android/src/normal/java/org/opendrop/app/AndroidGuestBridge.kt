@@ -39,6 +39,7 @@ class AndroidGuestBridge(
     private var activeSocket: Socket? = null
     private var activeParcel: ParcelFileDescriptor? = null
     @Volatile private var activeListener: ServerSocket? = null
+    @Volatile private var activeBeacon: NearbyHotspotBeacon? = null
     @Volatile private var connectingSocket: Socket? = null
     @Volatile private var sourceStream: InputStream? = null
 
@@ -157,7 +158,12 @@ class AndroidGuestBridge(
     fun acceptHotspotSocket(peerText: String, port: Int): Int {
         check(!cancelled.get()) { "Foreground sender was cancelled" }
         require(port in 1..65535)
-        val peer = privateIPv4(peerText)
+        // Only the explicit new nearby UI may use the special `auto`
+        // candidate; it still requires same-link peer validation, strict
+        // RPK TLS and mandatory human SAS. Legacy diagnostic exact-address
+        // operation retains the more restrictive source check.
+        val automaticPeer = peerText == "auto"
+        val peer = if (automaticPeer) null else privateIPv4(peerText)
         // Hotspot downstream is not exposed as an Android Wi-Fi Network on
         // many OEMs. Select only a nonvirtual Wi-Fi AP interface whose
         // actual InterfaceAddress prefix contains the explicit Linux peer.
@@ -177,15 +183,18 @@ class AndroidGuestBridge(
                 else {
                     val mask = (-1 shl (32 - prefix))
                     val a = local.address.fold(0) { n, b -> (n shl 8) or (b.toInt() and 255) }
-                    val b = peer.address.fold(0) { n, octet -> (n shl 8) or (octet.toInt() and 255) }
-                    if ((a and mask) == (b and mask)) local else null
+                    val allowed = peer == null || ((a and mask) ==
+                        (peer.address.fold(0) { n, octet ->
+                            (n shl 8) or (octet.toInt() and 255)
+                        } and mask))
+                    if (allowed) local to prefix else null
                 }
             }
         }.distinct()
         require(eligible.size == 1) {
             "No unique, directly attached private hotspot Wi-Fi interface for this peer"
         }
-        val local = eligible.single()
+        val (local, localPrefix) = eligible.single()
         // Binding only this local address prevents an accidental WAN,
         // wildcard, cellular, USB-forwarded or VPN listener.
         val listener = ServerSocket()
@@ -198,6 +207,16 @@ class AndroidGuestBridge(
                 check(activeListener == null && activeSocket == null && !cancelled.get())
                 activeListener = listener
             }
+            // Broadcast only via this bound local AP address. No cellular,
+            // VPN, generic default Network or all-interface listener.
+            if (automaticPeer) {
+                val beacon = NearbyHotspotBeacon(local, localPrefix, port)
+                synchronized(this) {
+                    check(!cancelled.get())
+                    activeBeacon = beacon
+                }
+                beacon.start()
+            }
             val end = SystemClock.elapsedRealtime() + 120_000L
             var accepted: Socket? = null
             while (!cancelled.get() && SystemClock.elapsedRealtime() < end) {
@@ -207,8 +226,11 @@ class AndroidGuestBridge(
             }
             val incoming = accepted ?: error("Owner foreground hotspot listener timed out/cancelled")
             try {
-                check(!cancelled.get() &&
-                    incoming.inetAddress == peer && incoming.localAddress == local) {
+                val actualPeer = incoming.inetAddress as? java.net.Inet4Address
+                check(!cancelled.get() && incoming.localAddress == local &&
+                    actualPeer != null &&
+                    (if (peer == null) NearbyLocalWire.sameLink(local, actualPeer, localPrefix)
+                     else actualPeer == peer)) {
                     "Unexpected source or destination; guest rejected before TLS"
                 }
                 // The AP may disappear while the owner inspects their phone.
@@ -230,6 +252,8 @@ class AndroidGuestBridge(
                 throw error
             }
         } finally {
+            runCatching { activeBeacon?.close() }
+            activeBeacon = null
             synchronized(this) { if (activeListener === listener) activeListener = null }
             runCatching { listener.close() }
         }
@@ -292,6 +316,7 @@ class AndroidGuestBridge(
         // Close the blocking acceptor BEFORE waiting on the monitor. A
         // stalled connect/source reader cannot delay cancellation of it.
         runCatching { activeListener?.close() }
+        runCatching { activeBeacon?.close() }
         runCatching { connectingSocket?.close() }
         runCatching { activeSocket?.close() }
         synchronized(this) {

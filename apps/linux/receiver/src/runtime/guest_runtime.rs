@@ -892,9 +892,17 @@ mod hosted_socket_tests {
     /// actions -> exact offer -> GuestReady -> real filesystem publisher ->
     /// committed receipt -> fresh original-key receipt-only TLS progression.
     /// The simulated UI never appears in a production executable.
-    fn run_transfer_and_recovery(peer_first: bool, lost_ack: bool) {
+    fn run_transfer_and_recovery(
+        peer_first: bool,
+        lost_ack: bool,
+        one_time_production_signer: bool,
+    ) {
         let (_temp, journal_path, destination, store) = temporary_owner_dirs();
-        let receiver = volatile_identity('b');
+        let receiver = if one_time_production_signer {
+            Arc::new(crate::ephemeral_guest::create_once().unwrap())
+        } else {
+            volatile_identity('b')
+        };
         let sender = volatile_identity('a');
         let mut admission = GuestAdmission::new_closed();
         admission.open_for_hosted_guest_fixture();
@@ -1064,12 +1072,20 @@ mod hosted_socket_tests {
 
     #[test]
     fn hosted_native_socket_guest_owner_first_all_stages_and_exact_recovery() {
-        run_transfer_and_recovery(false, false);
+        run_transfer_and_recovery(false, false, false);
     }
 
     #[test]
     fn hosted_native_socket_guest_peer_first_lost_ack_recovers_without_republication() {
-        run_transfer_and_recovery(true, true);
+        run_transfer_and_recovery(true, true, false);
+    }
+
+    #[test]
+    fn hosted_production_ram_only_linux_guest_signer_bilateral_sas_consent_and_receipt() {
+        // Uses the actual production ephemeral P256 signer—not the hosted
+        // test signer—to complete real TCP, strict RPK TLS, owner-simulated
+        // bilateral SAS, exact consent, SHA publication and in-process ODGR.
+        run_transfer_and_recovery(true, true, true);
     }
 
     /// The product Android sender crate, not the preexisting S1-C custom
@@ -1086,6 +1102,28 @@ mod hosted_socket_tests {
     }
 
     fn hosted_android_to_linux_transfer_and_recovery(reverse_tcp: bool) {
+        if reverse_tcp {
+            // The discovered candidate is an untrusted hint and chooses
+            // only the *physical* TCP direction. TLS Server and logical
+            // Receiver remain fixed in the code below.
+            use opendrop_core::nearby::{
+                AdvertisedRole, NearbyBeacon, NearbyCandidate, TcpDirection,
+            };
+            let announcement = NearbyBeacon::fresh(AdvertisedRole::SenderTcpListener)
+                .unwrap()
+                .encode();
+            let candidate = NearbyCandidate::from_packet(
+                &announcement,
+                "10.34.80.141".parse().unwrap(),
+                "10.34.80.134".parse().unwrap(),
+                24,
+            )
+            .unwrap();
+            assert_eq!(
+                candidate.receiver_tcp_direction(),
+                Ok(TcpDirection::LocalConnects)
+            );
+        }
         let (_temp, journal_path, destination, store) = temporary_owner_dirs();
         let receiver = volatile_identity('b');
         let sender = volatile_identity('a');

@@ -35,6 +35,7 @@ const MAX_TRANSFER_FRAMES: usize = 131_072;
 
 type TlsTransport = StreamOwned<ServerConnection, TcpStream>;
 mod guest_runtime;
+mod nearby_lan;
 mod reverse_tcp;
 use guest_runtime::{GuestConfig, GuestOfferRequest, GuestSasRequest};
 use reverse_tcp::DirectWifiRoute;
@@ -123,11 +124,13 @@ impl Drop for QtForeground {
 struct Settings {
     listen: Option<SocketAddr>,
     reverse: Option<DirectWifiRoute>,
+    nearby: bool,
     private_root: PathBuf,
     default_destination: PathBuf,
     tls_identity_root: Option<PathBuf>,
     guest: Option<GuestKeySettings>,
     kwallet_gpg: bool,
+    guest_ephemeral_once: bool,
 }
 
 #[derive(Debug)]
@@ -142,6 +145,7 @@ impl Settings {
     fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Self>, &'static str> {
         let mut arguments = args.into_iter();
         let mut listen = None;
+        let mut nearby = None;
         let mut connect_guest = None;
         let mut source_iface = None;
         let mut source_ip = None;
@@ -153,6 +157,7 @@ impl Settings {
         let mut guest_key_label = None;
         let mut guest_device_id = None;
         let mut kwallet_gpg = None;
+        let mut guest_ephemeral_once = None;
         while let Some(key) = arguments.next() {
             if key == "--help" {
                 return Ok(None);
@@ -160,6 +165,7 @@ impl Settings {
             let value = arguments.next().ok_or("Missing configuration value.")?;
             let field = match key.as_str() {
                 "--listen" => &mut listen,
+                "--nearby" => &mut nearby,
                 "--connect-guest" => &mut connect_guest,
                 "--source-iface" => &mut source_iface,
                 "--source-ip" => &mut source_ip,
@@ -171,14 +177,24 @@ impl Settings {
                 "--guest-key-label" => &mut guest_key_label,
                 "--guest-device-id" => &mut guest_device_id,
                 "--guest-kwallet-gpg" => &mut kwallet_gpg,
+                "--guest-ephemeral-once" => &mut guest_ephemeral_once,
                 _ => return Err("Unknown receiver option."),
             };
             if field.replace(value).is_some() {
                 return Err("Repeated receiver option.");
             }
         }
-        if listen.is_some() == connect_guest.is_some() {
-            return Err("Choose EXACTLY ONE explicit TCP direction.");
+        let nearby = match nearby {
+            Some(value) if value == "auto" => true,
+            None => false,
+            _ => return Err("Nearby transport selection must be automatic."),
+        };
+        if usize::from(listen.is_some())
+            + usize::from(connect_guest.is_some())
+            + usize::from(nearby)
+            != 1
+        {
+            return Err("Choose EXACTLY ONE nearby, explicit listener or diagnostic connector.");
         }
         let listen = listen
             .map(|ip| {
@@ -245,18 +261,31 @@ impl Settings {
             None => false,
             _ => return Err("KWallet6 GPG may only be selected explicitly."),
         };
+        let guest_ephemeral_once = match guest_ephemeral_once {
+            Some(value) if value == "explicit" => true,
+            None => false,
+            _ => return Err("One-time guest sharing requires explicit owner selection."),
+        };
+        if guest_ephemeral_once && (guest.is_some() || kwallet_gpg || tls_identity_root.is_some()) {
+            return Err(
+                "An expected trusted/protected identity must NEVER downgrade to one-time guest.",
+            );
+        }
         if kwallet_gpg && (guest.is_some() || tls_identity_root.is_some()) {
             return Err("Protected key profiles must never silently fall back or mix.");
         }
         if kwallet_gpg && !cfg!(feature = "kwallet-gpg") {
             return Err("Receiver was not built with reviewed KWallet6 GPG support.");
         }
-        if guest.is_none() && tls_identity_root.is_none() && !kwallet_gpg {
+        if guest.is_none() && tls_identity_root.is_none() && !kwallet_gpg && !guest_ephemeral_once {
             return Err(
                 "No provisioned paired identity or explicitly selected protected guest key.",
             );
         }
-        if reverse.is_some() && (!kwallet_gpg && guest.is_none() || tls_identity_root.is_some()) {
+        if (reverse.is_some() || nearby)
+            && (!kwallet_gpg && guest.is_none() && !guest_ephemeral_once
+                || tls_identity_root.is_some())
+        {
             return Err(
                 "Reverse TCP requires ONLY a protected guest identity, never legacy paired mode.",
             );
@@ -272,14 +301,23 @@ impl Settings {
         {
             return Err("Only absolute owner-controlled directories are allowed.");
         }
+        if guest_ephemeral_once && private_root.join("journal.sqlite").exists() {
+            // D-135 cannot infer that a pre-existing journal corresponds
+            // to an abandoned locked protected profile. New one-time
+            // sessions need a NEW isolated private staging root; never
+            // silently inherit existing identity/recovery history.
+            return Err("One-time guest requires a fresh private session root; existing identity/journal cannot be downgraded.");
+        }
         Ok(Some(Self {
             listen,
             reverse,
+            nearby,
             private_root,
             default_destination,
             tls_identity_root,
             guest,
             kwallet_gpg,
+            guest_ephemeral_once,
         }))
     }
 }
@@ -328,21 +366,25 @@ pub fn run() -> Result<(), &'static str> {
     }
     let Some(settings) = Settings::parse(args)? else {
         println!(
-            "OpenDrop Linux receiver (explicitly provisioned paired or guest mode)\n\
-             (--listen IP:port | --connect-guest PRIVATE_IPV4:port\n\
+            "OpenDrop Linux receiver (protected persistent or ONE-TIME verified guest mode)\n\
+             (--nearby auto | --listen IP:port | --connect-guest PRIVATE_IPV4:port\n\
                 --source-iface WIFI_IFACE --source-ip LOCAL_PRIVATE_IPV4)\n\
              --private-root ABS_PATH --destination ABS_PATH\n\
              [--tls-identity-root ABS_PATH]\n\
              [--guest-pkcs11-module ABS_PATH --guest-token-label LABEL\n\
               --guest-key-label LABEL --guest-device-id 32_HEX]\n\
              [--guest-kwallet-gpg explicit]\n\
+             [--guest-ephemeral-once explicit]\n\
              Legacy paired mode requires an independently provisioned 0700 identity folder with\n\
              server-cert.der, server-key.pkcs8.der, paired-client-root.der.\n\
              Guest mode requires EITHER a strictly preprovisioned hardware token\n\
              OR an explicitly selected independently verified GPG-encrypted\n\
              persistent KDE KWallet6 software identity (no automatic fallback).\n\
-             Separate --provision-kwallet-gpg is an OFFLINE owner-only action\n\
-             after creating a dedicated protected GPG wallet; no default key."
+             Separate --provision-kwallet-gpg is an OFFLINE owner-only action.\n\
+             One-time mode generates a fresh RAM-only P256 key each launch,\n\
+             offers NO permanent trust/autoaccept/postrestart receipt recovery.\n\
+             Nearby mode selects actual private LAN or phone-hotspot transport\n\
+             without exposing manual IP/interface configuration in the UI."
         );
         return Ok(());
     };
@@ -391,6 +433,22 @@ pub fn run() -> Result<(), &'static str> {
     } else {
         guest
     };
+    let guest = if settings.guest_ephemeral_once {
+        let _ = opendrop_core::identity_profile::authorize_identity_profile(
+            opendrop_core::identity_profile::IdentityProfile::OneTimeVerifiedGuest,
+            opendrop_core::identity_profile::ExpectedProtectedIdentity::NewInstallationNoProtectedIdentity,
+            true,
+        ).map_err(|_| "One-time guest cannot inherit protected identity trust.")?;
+        let identity = crate::ephemeral_guest::create_once()
+            .map_err(|_| "OS random P256 one-time identity unavailable: nothing opened.")?;
+        Some(Arc::new(GuestConfig {
+            identity: Arc::new(identity),
+            admission: Arc::new(Mutex::new(GuestAdmission::new_closed())),
+            live: Arc::new(Mutex::new(None)),
+        }))
+    } else {
+        guest
+    };
     let storage =
         LinuxReceiverStorage::open_private(&settings.private_root, &settings.default_destination)
             .map_err(|_| "Private staging or owner destination directory is unsafe.")?;
@@ -403,6 +461,9 @@ pub fn run() -> Result<(), &'static str> {
     // Uncertain CommitIntent and unidentified inventory remain untouched.
     // Never auto-republish, fabricate a receipt or silently delete them.
     foreground.guest_available(guest.is_some());
+    if settings.guest_ephemeral_once {
+        display(b"One-time verified guest: no trusted pairing or recovery after identity loss.\0");
+    }
     if recovery.preserved_unresolved_intent != 0
         || recovery.preserved_unverifiable_destination != 0
         || recovery.unidentified_private_entries != 0
@@ -424,20 +485,32 @@ pub fn run() -> Result<(), &'static str> {
     let (events_tx, events_rx) = mpsc::sync_channel::<UiEvent>(4);
     let worker_live = running.clone();
     let worker_guest = guest.clone();
-    let worker = thread::spawn(move || match (listener, settings.reverse) {
-        (Some(listener), None) => accept_single_peer(
-            listener,
-            config,
-            worker_guest,
-            journal_path,
-            events_tx,
-            worker_live,
-        ),
-        (None, Some(route)) => {
-            connect_one_foreground_guest(route, worker_guest, journal_path, events_tx, worker_live)
-        }
-        _ => {}
-    });
+    let worker = thread::spawn(
+        move || match (listener, settings.reverse, settings.nearby) {
+            (Some(listener), None, false) => accept_single_peer(
+                listener,
+                config,
+                worker_guest,
+                journal_path,
+                events_tx,
+                worker_live,
+            ),
+            (None, Some(route), false) => connect_one_foreground_guest(
+                route,
+                worker_guest,
+                journal_path,
+                events_tx,
+                worker_live,
+            ),
+            (None, None, true) => serve_one_automatically_discovered_guest(
+                worker_guest,
+                journal_path,
+                events_tx,
+                worker_live,
+            ),
+            _ => {}
+        },
+    );
     let mut was_guest_visible = false;
     while foreground.poll() {
         if let Some(guest) = guest.as_ref() {
@@ -653,6 +726,60 @@ fn connect_one_foreground_guest(
         Err(_) => {
             let _ = ui.try_send(UiEvent::Status(
                 b"Direct Wi-Fi connector rejected source, route or Android listener.\0",
+            ));
+        }
+    }
+}
+
+/// Normal-user local sharing. The owner opens temporary Everyone through the
+/// existing native Qt UI; this starts exactly one private interface-scoped
+/// discovery/transport session, not a background listener or a new protocol.
+fn serve_one_automatically_discovered_guest(
+    guest: Option<Arc<GuestConfig>>,
+    journal_path: PathBuf,
+    ui: SyncSender<UiEvent>,
+    running: Arc<AtomicBool>,
+) {
+    let Some(guest) = guest else {
+        return;
+    };
+    let _ = ui.try_send(UiEvent::Status(
+        b"Choose Everyone to receive one nearby verified share.\0",
+    ));
+    while running.load(Ordering::Acquire) {
+        if guest
+            .admission
+            .lock()
+            .ok()
+            .is_some_and(|admission| !admission.remaining_visibility().is_zero())
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(80));
+    }
+    if !running.load(Ordering::Acquire) {
+        return;
+    }
+    match nearby_lan::wait_for_nearby_transfer(&running) {
+        Ok(stream) => {
+            let outcome = guest_runtime::route_connection(
+                stream,
+                None,
+                Some(&guest),
+                &journal_path,
+                &ui,
+                &running,
+            );
+            let message: &'static [u8] = if outcome.is_ok() {
+                b"Nearby guest session ended. Never infer success without authenticated Complete.\0"
+            } else {
+                b"Nearby connection/transfer failed closed; no automatic file retry.\0"
+            };
+            let _ = ui.try_send(UiEvent::Status(message));
+        }
+        Err(_) => {
+            let _ = ui.try_send(UiEvent::Status(
+                b"Local discovery or private transport unavailable; no Internet fallback.\0",
             ));
         }
     }
