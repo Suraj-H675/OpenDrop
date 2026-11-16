@@ -11,7 +11,10 @@ import android.widget.TextView
 import java.io.InputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
+import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -35,6 +38,8 @@ class AndroidGuestBridge(
     private val receipts = ProtectedReceiptStore(activity)
     private var activeSocket: Socket? = null
     private var activeParcel: ParcelFileDescriptor? = null
+    @Volatile private var activeListener: ServerSocket? = null
+    @Volatile private var connectingSocket: Socket? = null
     @Volatile private var sourceStream: InputStream? = null
 
     fun installationId(): String = identity.installationId()
@@ -87,7 +92,6 @@ class AndroidGuestBridge(
         return InetAddress.getByAddress(bytes.map(Int::toByte).toByteArray())
     }
 
-    @Synchronized
     fun openLanSocket(host: String, port: Int): Int {
         check(!cancelled.get()) { "Foreground sender was cancelled" }
         require(port in 1..65535)
@@ -115,25 +119,126 @@ class AndroidGuestBridge(
         }
         closeNetwork()
         val socket = available.single().socketFactory.createSocket()
+        synchronized(this) {
+            check(!cancelled.get() && connectingSocket == null &&
+                activeSocket == null && activeListener == null)
+            connectingSocket = socket
+        }
         try {
             socket.connect(InetSocketAddress(peer, port), 8000)
+            check(!cancelled.get()) { "Foreground session was cancelled" }
             socket.soTimeout = 250
             // Android API 26–28: fromSocket() may borrow an original fd.
             // dup() gives Rust its own fd; keep the wrapper and Socket alive
             // until cancellation rather than allowing premature GC.
             val parcel = ParcelFileDescriptor.fromSocket(socket)
             val descriptor = parcel.dup().detachFd()
-            activeSocket = socket
-            activeParcel = parcel
+            synchronized(this) {
+                check(!cancelled.get())
+                activeSocket = socket
+                activeParcel = parcel
+            }
             return descriptor
         } catch (error: Exception) {
             socket.close()
             throw error
+        } finally {
+            synchronized(this) {
+                if (connectingSocket === socket) connectingSocket = null
+            }
+        }
+    }
+
+    /** TCP ACCEPTOR, but TLS CLIENT and logical FILE SENDER. Nothing binds
+     * until the owner explicitly selects the one-shot hotspot-host action.
+     * Never trust the cellular default Network or an AP-dependent NetworkAgent.
+     * A concrete interface address, direct subnet and exact peer are mandatory.
+     */
+    fun acceptHotspotSocket(peerText: String, port: Int): Int {
+        check(!cancelled.get()) { "Foreground sender was cancelled" }
+        require(port in 1..65535)
+        val peer = privateIPv4(peerText)
+        // Hotspot downstream is not exposed as an Android Wi-Fi Network on
+        // many OEMs. Select only a nonvirtual Wi-Fi AP interface whose
+        // actual InterfaceAddress prefix contains the explicit Linux peer.
+        val interfaces = NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
+        val eligible = interfaces.filter { iface ->
+            val name = iface.name.orEmpty()
+            (name.startsWith("wlan") || name.startsWith("ap") ||
+                name.startsWith("swlan") || name.startsWith("tether")) &&
+                iface.isUp && !iface.isLoopback && !iface.isVirtual &&
+                !iface.isPointToPoint
+        }.flatMap { iface ->
+            iface.interfaceAddresses.mapNotNull { address ->
+                val local = address.address
+                val prefix = address.networkPrefixLength.toInt()
+                if (local !is java.net.Inet4Address || prefix !in 16..30 ||
+                    !local.isSiteLocalAddress || local == peer) null
+                else {
+                    val mask = (-1 shl (32 - prefix))
+                    val a = local.address.fold(0) { n, b -> (n shl 8) or (b.toInt() and 255) }
+                    val b = peer.address.fold(0) { n, octet -> (n shl 8) or (octet.toInt() and 255) }
+                    if ((a and mask) == (b and mask)) local else null
+                }
+            }
+        }.distinct()
+        require(eligible.size == 1) {
+            "No unique, directly attached private hotspot Wi-Fi interface for this peer"
+        }
+        val local = eligible.single()
+        // Binding only this local address prevents an accidental WAN,
+        // wildcard, cellular, USB-forwarded or VPN listener.
+        val listener = ServerSocket()
+        try {
+            listener.reuseAddress = false
+            listener.bind(InetSocketAddress(local, port), 1)
+            listener.soTimeout = 250
+            check(!cancelled.get()) { "Foreground session cancelled" }
+            synchronized(this) {
+                check(activeListener == null && activeSocket == null && !cancelled.get())
+                activeListener = listener
+            }
+            val end = SystemClock.elapsedRealtime() + 120_000L
+            var accepted: Socket? = null
+            while (!cancelled.get() && SystemClock.elapsedRealtime() < end) {
+                accepted = try { listener.accept() }
+                catch (_: SocketTimeoutException) { continue }
+                break
+            }
+            val incoming = accepted ?: error("Owner foreground hotspot listener timed out/cancelled")
+            try {
+                check(!cancelled.get() &&
+                    incoming.inetAddress == peer && incoming.localAddress == local) {
+                    "Unexpected source or destination; guest rejected before TLS"
+                }
+                // The AP may disappear while the owner inspects their phone.
+                val stillLocal = NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
+                    .any { it.isUp && !it.isLoopback &&
+                        it.interfaceAddresses.any { address -> address.address == local } }
+                check(stillLocal) { "Hotspot-local interface disappeared" }
+                incoming.soTimeout = 250
+                val parcel = ParcelFileDescriptor.fromSocket(incoming)
+                val descriptor = parcel.dup().detachFd()
+                synchronized(this) {
+                    check(!cancelled.get())
+                    activeSocket = incoming
+                    activeParcel = parcel
+                }
+                return descriptor
+            } catch (error: Exception) {
+                incoming.close()
+                throw error
+            }
+        } finally {
+            synchronized(this) { if (activeListener === listener) activeListener = null }
+            runCatching { listener.close() }
         }
     }
 
     @Synchronized
+    @Synchronized
     private fun closeNetwork() {
+        runCatching { connectingSocket?.close() }
         runCatching { activeSocket?.close() }
         runCatching { activeParcel?.close() }
         activeSocket = null
@@ -185,6 +290,11 @@ class AndroidGuestBridge(
 
     fun cancel() {
         cancelled.set(true)
+        // Close the blocking acceptor BEFORE waiting on the monitor. A
+        // stalled connect/source reader cannot delay cancellation of it.
+        runCatching { activeListener?.close() }
+        runCatching { connectingSocket?.close() }
+        runCatching { activeSocket?.close() }
         synchronized(this) {
             closeNetwork()
             closeSource()

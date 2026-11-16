@@ -8,6 +8,7 @@ publish = false
 # Only the native Linux foreground application enables this. Headless/core
 # users (including Windows/Android consumers) have no Qt build dependency.
 linux-qt-consent = ["dep:rustix"]
+linux-kwallet-gpg = ["linux-qt-consent"]
 # Explicit CI-only native socket fixture gate. Never enabled by production
 # receiver builds; no runtime CLI can select its synthetic owner actions.
 hosted-guest-fixture = []

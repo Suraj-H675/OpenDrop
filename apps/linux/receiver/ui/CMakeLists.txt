@@ -8,6 +8,13 @@ target_compile_features(opendrop-linux-owner-prompt PUBLIC cxx_std_17)
 set_target_properties(opendrop-linux-owner-prompt PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(opendrop-linux-owner-prompt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(opendrop-linux-owner-prompt PUBLIC Qt6::Widgets PkgConfig::SYSTEMD)
+# Optional source/build profile, never silently selected as a fallback.
+option(OPENDROP_KWALLET_GPG "Link explicit KDE KWallet6 GPG backend" OFF)
+if(OPENDROP_KWALLET_GPG)
+    find_package(KF6Wallet CONFIG REQUIRED)
+    target_sources(opendrop-linux-owner-prompt PRIVATE KWalletGpg.cpp)
+    target_link_libraries(opendrop-linux-owner-prompt PUBLIC KF6::Wallet)
+endif()
 # No network service, IPC or ticket issuer. This native library only presents
 # the owner-facing modal UI and returns its result to the Rust core authority.
 

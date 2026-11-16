@@ -81,6 +81,16 @@ class GuestRuntimeInstrumentation : Instrumentation() {
             "real JNI Rust P256 signer and SPKI")
         GuestNative.cancel()
 
+        // A disposable emulator normally has no tethered Wi-Fi access point.
+        // The production reverse mode must reject a private but unadvertised
+        // local subnet BEFORE creating any listener or attempting peer I/O.
+        checkpoint = "hotspot-host-route-deny-without-real-local-ap"
+        val hotspot = AndroidGuestBridge(activity, emptyList())
+        requireTest(runCatching {
+            hotspot.acceptHotspotSocket("10.253.251.134", 43991)
+        }.isFailure, "no hotspot interface => no listener or cellular fallback")
+        hotspot.cancel()
+
         val uris = listOf("first", "second", "denied").map {
             Uri.parse("content://org.opendrop.app.test.fixtures/" + it)
         }

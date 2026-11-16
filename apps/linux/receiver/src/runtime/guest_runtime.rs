@@ -1077,6 +1077,15 @@ mod hosted_socket_tests {
     /// native platform ports (KeyStore and UI) are simulated in this fixture.
     #[test]
     fn hosted_android_sender_engine_reaches_native_linux_and_recovers_exact_receipt() {
+        hosted_android_to_linux_transfer_and_recovery(false);
+    }
+
+    #[test]
+    fn hosted_reversed_physical_tcp_preserves_tls_roles_sas_publication_and_odgr() {
+        hosted_android_to_linux_transfer_and_recovery(true);
+    }
+
+    fn hosted_android_to_linux_transfer_and_recovery(reverse_tcp: bool) {
         let (_temp, journal_path, destination, store) = temporary_owner_dirs();
         let receiver = volatile_identity('b');
         let sender = volatile_identity('a');
@@ -1089,6 +1098,7 @@ mod hosted_socket_tests {
         });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let android_listener = listener.try_clone().unwrap();
         let running = Arc::new(AtomicBool::new(true));
         let (ui_tx, ui_rx) = mpsc::sync_channel::<UiEvent>(4);
         let (code_tx, code_rx) = mpsc::sync_channel::<String>(1);
@@ -1098,9 +1108,26 @@ mod hosted_socket_tests {
         let server_journal = journal_path.clone();
         let server_ui = ui_tx.clone();
         let server = thread::spawn(move || {
-            // Exactly one accepted ODGH followed by one read-only ODGR.
+            // Linux is the TLS SERVER and FILE RECEIVER regardless of TCP
+            // acceptor/connector. One ODGH then fresh receipt-only ODGR.
             for _ in 0..2 {
-                let (socket, _) = listener.accept().unwrap();
+                let socket = if reverse_tcp {
+                    super::super::reverse_tcp::connect_exact(
+                        &super::super::reverse_tcp::DirectWifiRoute {
+                            interface: "lo".into(),
+                            source: std::net::Ipv4Addr::LOCALHOST,
+                            peer: std::net::SocketAddrV4::new(
+                                std::net::Ipv4Addr::LOCALHOST,
+                                addr.port(),
+                            ),
+                        },
+                        &server_running,
+                        true,
+                    )
+                    .unwrap()
+                } else {
+                    listener.accept().unwrap().0
+                };
                 let outcome = route_connection(
                     socket,
                     None,
@@ -1149,7 +1176,13 @@ mod hosted_socket_tests {
         let data: Vec<u8> = (0..144_003).map(|n| (n % 239) as u8).collect();
         let (size, digest) = prehash_source(&mut io::Cursor::new(&data), None).unwrap();
         let offered = prepare_android_offer(&sender, "android-to-linux.bin", size, digest).unwrap();
-        let socket = TcpStream::connect(addr).unwrap();
+        let socket = if reverse_tcp {
+            // Inverted physical direction. Android is TCP acceptor but
+            // remains cryptographic TLS CLIENT and logical FILE SENDER.
+            android_listener.accept().unwrap().0
+        } else {
+            TcpStream::connect(addr).unwrap()
+        };
         socket
             .set_read_timeout(Some(Duration::from_millis(250)))
             .unwrap();
@@ -1183,7 +1216,14 @@ mod hosted_socket_tests {
         // this hosted test does NOT impersonate Android's hardware security.
         let pending = PendingRecovery::decode_from_android_keystore(&sealed.unwrap()).unwrap();
         assert_eq!(pending.transfer_id(), offered.id());
-        let recovery_socket = TcpStream::connect(addr).unwrap();
+        let recovery_socket = if reverse_tcp {
+            // Fresh connection with identical P256 identity and ODGR scope.
+            // The production app creates a NEW one-shot listener, while
+            // this disposable loopback fixture reuses the owner socket.
+            android_listener.accept().unwrap().0
+        } else {
+            TcpStream::connect(addr).unwrap()
+        };
         recovery_socket
             .set_read_timeout(Some(Duration::from_millis(250)))
             .unwrap();

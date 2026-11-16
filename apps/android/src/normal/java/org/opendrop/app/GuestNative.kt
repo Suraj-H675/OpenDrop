@@ -14,10 +14,28 @@ class GuestNative private constructor() {
             port: Int,
         ): String
 
+        /** Hotspot-host TCP ACCEPT with unchanged TLS CLIENT and FILE SENDER. */
+        @JvmStatic external fun sendHotspot(
+            bridge: AndroidGuestBridge,
+            index: Int,
+            name: String,
+            declaredSize: Long,
+            linuxPeer: String,
+            port: Int,
+        ): String
+
         @JvmStatic external fun recoverOne(
             bridge: AndroidGuestBridge,
             transferId: String,
             host: String,
+            port: Int,
+        ): String
+
+        /** Fresh one-shot listener; only authenticated ODGR receipt query. */
+        @JvmStatic external fun recoverHotspot(
+            bridge: AndroidGuestBridge,
+            transferId: String,
+            linuxPeer: String,
             port: Int,
         ): String
 

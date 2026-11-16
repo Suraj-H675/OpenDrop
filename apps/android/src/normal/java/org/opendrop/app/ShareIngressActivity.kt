@@ -23,7 +23,9 @@ class ShareIngressActivity : Activity() {
     private lateinit var endpoint: EditText
     private lateinit var port: EditText
     private lateinit var send: Button
+    private lateinit var hotspot: Button
     private lateinit var recover: Button
+    private lateinit var recoverHotspot: Button
     private var sources: List<SharedFile> = emptyList()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -69,16 +71,27 @@ class ShareIngressActivity : Activity() {
         column.addView(endpoint)
         column.addView(port)
         send = Button(this).apply {
-            text = "Send with code verification"
+            text = "Send over Wi-Fi client LAN"
             isEnabled = sources.isNotEmpty()
-            setOnClickListener { startTransfer(false) }
+            setOnClickListener { startTransfer(false, null, false) }
+        }
+        hotspot = Button(this).apply {
+            text = "Wait for Linux via phone hotspot (one connection)"
+            isEnabled = sources.isNotEmpty()
+            setOnClickListener { startTransfer(false, null, true) }
         }
         recover = Button(this).apply {
-            text = "Choose unresolved receipt to recover"
-            setOnClickListener { chooseRecovery() }
+            text = "Recover previous receipt over Wi-Fi LAN"
+            setOnClickListener { chooseRecovery(false) }
+        }
+        recoverHotspot = Button(this).apply {
+            text = "Wait for Linux to recover an exact receipt (hotspot)"
+            setOnClickListener { chooseRecovery(true) }
         }
         column.addView(send)
+        column.addView(hotspot)
         column.addView(recover)
+        column.addView(recoverHotspot)
         column.addView(Button(this).apply {
             text = "Cancel and close connection"
             setOnClickListener {
@@ -105,7 +118,7 @@ class ShareIngressActivity : Activity() {
         runCatching { GuestNative.cancel() }
     }
 
-    private fun chooseRecovery() {
+    private fun chooseRecovery(reverseTcp: Boolean) {
         if (sending || isFinishing || isDestroyed) return
         try {
             val entries = ProtectedReceiptStore(this).pendingIds()
@@ -118,7 +131,8 @@ class ShareIngressActivity : Activity() {
             AlertDialog.Builder(this)
                 .setTitle("Recover one existing committed receipt")
                 .setItems(entries.toTypedArray()) { _, choice ->
-                    if (!isFinishing && !isDestroyed) startTransfer(true, entries[choice])
+                    if (!isFinishing && !isDestroyed)
+                        startTransfer(true, entries[choice], reverseTcp)
                 }
                 .setNegativeButton("Cancel", null)
                 .show()
@@ -127,7 +141,9 @@ class ShareIngressActivity : Activity() {
         }
     }
 
-    private fun startTransfer(recovery: Boolean, selectedRecoveryId: String? = null) {
+    private fun startTransfer(
+        recovery: Boolean, selectedRecoveryId: String? = null, reverseTcp: Boolean
+    ) {
         if (sending) return
         val host = endpoint.text.toString().trim()
         val number = port.text.toString().toIntOrNull()
@@ -139,7 +155,9 @@ class ShareIngressActivity : Activity() {
         bridge = localBridge
         sending = true
         send.isEnabled = false
+        hotspot.isEnabled = false
         recover.isEnabled = false
+        recoverHotspot.isEnabled = false
         updateStatus(if (recovery) "Checking the exact committed receipt…" else "Hashing the granted source stream…")
         Thread({
             try {
@@ -147,12 +165,17 @@ class ShareIngressActivity : Activity() {
                     val id = selectedRecoveryId
                         ?.takeIf { it in localBridge.pendingRecoveryIds() }
                         ?: error("Selected recovery is unavailable. Never blindly reupload.")
-                    val result = GuestNative.recoverOne(localBridge, id, host, number)
+                    val result = if (reverseTcp)
+                        GuestNative.recoverHotspot(localBridge, id, host, number)
+                    else GuestNative.recoverOne(localBridge, id, host, number)
                     updateStatus(result)
                 } else {
                     for ((index, source) in sources.withIndex()) {
                         updateStatus("Sending ${index + 1}/${sources.size}: ${source.name}. Verify the same code on the receiver.")
-                        val result = GuestNative.sendOne(
+                        val result = if (reverseTcp)
+                            GuestNative.sendHotspot(localBridge, index, source.name,
+                                source.declaredSize ?: -1L, host, number)
+                        else GuestNative.sendOne(
                             localBridge, index, source.name, source.declaredSize ?: -1L, host, number)
                         updateStatus(result)
                         if (!result.startsWith("OK:")) break
@@ -168,7 +191,9 @@ class ShareIngressActivity : Activity() {
                     sending = false
                     if (!isDestroyed) {
                         send.isEnabled = sources.isNotEmpty()
+                        hotspot.isEnabled = sources.isNotEmpty()
                         recover.isEnabled = true
+                        recoverHotspot.isEnabled = true
                     }
                 }
                 bridge = null

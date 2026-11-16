@@ -18,6 +18,7 @@ fn checked(program: &str, args: &[&str]) -> String {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LINUX_QT_CONSENT");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LINUX_KWALLET_GPG");
     if env::var_os("CARGO_FEATURE_LINUX_QT_CONSENT").is_none()
         || env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux")
     {
@@ -35,14 +36,27 @@ fn main() {
         "IncomingOfferDialog.hpp",
         "IncomingOfferDialog.cpp",
         "QtConsentBridge.cpp",
+        "KWalletGpg.cpp",
     ] {
         println!("cargo:rerun-if-changed={}", qt_source.join(name).display());
     }
     let source = qt_source.to_str().expect("Qt source path must be UTF-8");
     let build = output.to_str().expect("Qt build path must be UTF-8");
+    let kwallet_enabled = env::var_os("CARGO_FEATURE_LINUX_KWALLET_GPG").is_some();
     checked(
         "cmake",
-        &["-S", source, "-B", build, "-DCMAKE_BUILD_TYPE=Release"],
+        &[
+            "-S",
+            source,
+            "-B",
+            build,
+            "-DCMAKE_BUILD_TYPE=Release",
+            if kwallet_enabled {
+                "-DOPENDROP_KWALLET_GPG=ON"
+            } else {
+                "-DOPENDROP_KWALLET_GPG=OFF"
+            },
+        ],
     );
     checked(
         "cmake",
@@ -60,7 +74,14 @@ fn main() {
 
     // CMake uses Qt6Widgets and libsystemd. Link the exact libraries found
     // by the runner's pkg-config, not guessed absolute host library paths.
-    let flags = checked("pkg-config", &["--libs", "Qt6Widgets", "libsystemd"]);
+    let flags = if kwallet_enabled {
+        checked(
+            "pkg-config",
+            &["--libs", "Qt6Widgets", "Qt6DBus", "libsystemd"],
+        )
+    } else {
+        checked("pkg-config", &["--libs", "Qt6Widgets", "libsystemd"])
+    };
     for flag in flags.split_whitespace() {
         if let Some(library) = flag.strip_prefix("-l") {
             println!("cargo:rustc-link-lib={library}");
@@ -69,6 +90,12 @@ fn main() {
         } else if flag != "-pthread" {
             panic!("unreviewed Qt/systemd linker argument: {flag}");
         }
+    }
+    if kwallet_enabled {
+        // The CMake KF6::Wallet imported target resolves libKF6Wallet.so.
+        // No Secret Service or wallet backend is linked in the default
+        // PKCS11-only executable.
+        println!("cargo:rustc-link-lib=KF6Wallet");
     }
     println!("cargo:rustc-link-lib=stdc++");
 }

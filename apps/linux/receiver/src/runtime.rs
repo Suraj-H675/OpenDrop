@@ -15,7 +15,7 @@ use opendrop_linux_receiver::tls::load_provisioned_tls;
 use opendrop_linux_receiver::{ForegroundLinuxReceiver, SessionCancellation};
 use rustls::{ServerConnection, StreamOwned};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -35,7 +35,9 @@ const MAX_TRANSFER_FRAMES: usize = 131_072;
 
 type TlsTransport = StreamOwned<ServerConnection, TcpStream>;
 mod guest_runtime;
+mod reverse_tcp;
 use guest_runtime::{GuestConfig, GuestOfferRequest, GuestSasRequest};
+use reverse_tcp::DirectWifiRoute;
 
 /// Per-frame budget independent of fragmented reads, temporary OS socket
 /// timeouts or peer-controlled chunk boundaries. The underlying socket has
@@ -119,11 +121,13 @@ impl Drop for QtForeground {
 
 #[derive(Debug)]
 struct Settings {
-    listen: SocketAddr,
+    listen: Option<SocketAddr>,
+    reverse: Option<DirectWifiRoute>,
     private_root: PathBuf,
     default_destination: PathBuf,
     tls_identity_root: Option<PathBuf>,
     guest: Option<GuestKeySettings>,
+    kwallet_gpg: bool,
 }
 
 #[derive(Debug)]
@@ -138,6 +142,9 @@ impl Settings {
     fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Self>, &'static str> {
         let mut arguments = args.into_iter();
         let mut listen = None;
+        let mut connect_guest = None;
+        let mut source_iface = None;
+        let mut source_ip = None;
         let mut private_root = None;
         let mut default_destination = None;
         let mut tls_identity_root = None;
@@ -145,6 +152,7 @@ impl Settings {
         let mut guest_token_label = None;
         let mut guest_key_label = None;
         let mut guest_device_id = None;
+        let mut kwallet_gpg = None;
         while let Some(key) = arguments.next() {
             if key == "--help" {
                 return Ok(None);
@@ -152,6 +160,9 @@ impl Settings {
             let value = arguments.next().ok_or("Missing configuration value.")?;
             let field = match key.as_str() {
                 "--listen" => &mut listen,
+                "--connect-guest" => &mut connect_guest,
+                "--source-iface" => &mut source_iface,
+                "--source-ip" => &mut source_ip,
                 "--private-root" => &mut private_root,
                 "--destination" => &mut default_destination,
                 "--tls-identity-root" => &mut tls_identity_root,
@@ -159,19 +170,49 @@ impl Settings {
                 "--guest-token-label" => &mut guest_token_label,
                 "--guest-key-label" => &mut guest_key_label,
                 "--guest-device-id" => &mut guest_device_id,
+                "--guest-kwallet-gpg" => &mut kwallet_gpg,
                 _ => return Err("Unknown receiver option."),
             };
             if field.replace(value).is_some() {
                 return Err("Repeated receiver option.");
             }
         }
-        let address = listen
-            .ok_or("Explicit numeric --listen IP:port is required.")?
-            .parse::<SocketAddr>()
-            .map_err(|_| "Invalid numeric listening IP:port.")?;
-        if address.port() == 0 {
+        if listen.is_some() == connect_guest.is_some() {
+            return Err("Choose EXACTLY ONE explicit TCP direction.");
+        }
+        let listen = listen
+            .map(|ip| {
+                ip.parse::<SocketAddr>()
+                    .map_err(|_| "Invalid numeric listening IP:port.")
+            })
+            .transpose()?;
+        if listen.as_ref().is_some_and(|address| address.port() == 0) {
             return Err("A fixed nonzero listening port is required.");
         }
+        let reverse = if let Some(connect) = connect_guest {
+            let peer = connect
+                .parse::<SocketAddrV4>()
+                .map_err(|_| "Reverse peer must be a numeric private IPv4:port.")?;
+            let source = source_ip
+                .ok_or("Reverse TCP requires source IPv4.")?
+                .parse::<Ipv4Addr>()
+                .map_err(|_| "Invalid source IPv4.")?;
+            let interface = source_iface.ok_or("Reverse TCP requires explicit Wi-Fi interface.")?;
+            let route = DirectWifiRoute {
+                interface,
+                source,
+                peer,
+            };
+            route
+                .validate(false)
+                .map_err(|_| "Reverse route/interface not safe or directly attached.")?;
+            Some(route)
+        } else {
+            if source_ip.is_some() || source_iface.is_some() {
+                return Err("Source interface applies only to reverse TCP.");
+            }
+            None
+        };
         let private_root = PathBuf::from(private_root.ok_or("Missing private root.")?);
         let default_destination =
             PathBuf::from(default_destination.ok_or("Missing owner destination.")?);
@@ -199,8 +240,26 @@ impl Settings {
         } else {
             None
         };
-        if guest.is_none() && tls_identity_root.is_none() {
-            return Err("No provisioned paired identity or guest hardware key.");
+        let kwallet_gpg = match kwallet_gpg {
+            Some(choice) if choice == "explicit" => true,
+            None => false,
+            _ => return Err("KWallet6 GPG may only be selected explicitly."),
+        };
+        if kwallet_gpg && (guest.is_some() || tls_identity_root.is_some()) {
+            return Err("Protected key profiles must never silently fall back or mix.");
+        }
+        if kwallet_gpg && !cfg!(feature = "kwallet-gpg") {
+            return Err("Receiver was not built with reviewed KWallet6 GPG support.");
+        }
+        if guest.is_none() && tls_identity_root.is_none() && !kwallet_gpg {
+            return Err(
+                "No provisioned paired identity or explicitly selected protected guest key.",
+            );
+        }
+        if reverse.is_some() && (!kwallet_gpg && guest.is_none() || tls_identity_root.is_some()) {
+            return Err(
+                "Reverse TCP requires ONLY a protected guest identity, never legacy paired mode.",
+            );
         }
         let tls_identity_root = tls_identity_root.map(PathBuf::from);
         if [&private_root, &default_destination]
@@ -214,11 +273,13 @@ impl Settings {
             return Err("Only absolute owner-controlled directories are allowed.");
         }
         Ok(Some(Self {
-            listen: address,
+            listen,
+            reverse,
             private_root,
             default_destination,
             tls_identity_root,
             guest,
+            kwallet_gpg,
         }))
     }
 }
@@ -246,18 +307,42 @@ pub fn run() -> Result<(), &'static str> {
                 .map_err(|_| "Receiver arguments must be valid UTF-8.")
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if args == ["--provision-kwallet-gpg"] {
+        #[cfg(feature = "kwallet-gpg")]
+        {
+            // This separate command never creates a network listener,
+            // transfer journal, destination or private-key file. It may
+            // prompt the owner through the real KDE native wallet.
+            let _owner_ui = QtForeground::start()?;
+            let device = crate::kwallet_gpg::provision_new_owner_identity().map_err(|_| {
+                "Existing owner GPG wallet absent/unsafe/locked, or identity already provisioned."
+            })?;
+            println!(
+                "OpenDrop protected software identity provisioned: {}",
+                device.as_str()
+            );
+            return Ok(());
+        }
+        #[cfg(not(feature = "kwallet-gpg"))]
+        return Err("KWallet6 GPG support not compiled; no provisioning attempted.");
+    }
     let Some(settings) = Settings::parse(args)? else {
         println!(
             "OpenDrop Linux receiver (explicitly provisioned paired or guest mode)\n\
-             --listen IP:port --private-root ABS_PATH --destination ABS_PATH\n\
+             (--listen IP:port | --connect-guest PRIVATE_IPV4:port\n\
+                --source-iface WIFI_IFACE --source-ip LOCAL_PRIVATE_IPV4)\n\
+             --private-root ABS_PATH --destination ABS_PATH\n\
              [--tls-identity-root ABS_PATH]\n\
              [--guest-pkcs11-module ABS_PATH --guest-token-label LABEL\n\
               --guest-key-label LABEL --guest-device-id 32_HEX]\n\
+             [--guest-kwallet-gpg explicit]\n\
              Legacy paired mode requires an independently provisioned 0700 identity folder with\n\
              server-cert.der, server-key.pkcs8.der, paired-client-root.der.\n\
-             Guest mode requires an independently provisioned hardware-token P-256 signing key\n\
-             with a protected authentication path. No software identity, automatic enrollment,\n\
-             installation or implicit trust provisioning is performed."
+             Guest mode requires EITHER a strictly preprovisioned hardware token\n\
+             OR an explicitly selected independently verified GPG-encrypted\n\
+             persistent KDE KWallet6 software identity (no automatic fallback).\n\
+             Separate --provision-kwallet-gpg is an OFFLINE owner-only action\n\
+             after creating a dedicated protected GPG wallet; no default key."
         );
         return Ok(());
     };
@@ -269,6 +354,10 @@ pub fn run() -> Result<(), &'static str> {
         .map(|root| load_provisioned_tls(root))
         .transpose()
         .map_err(|_| "No valid provisioned TLS identity and client trust root. Not listening.")?;
+    // KDE native wallet dialogs require the same foreground QApplication
+    // thread that handles the user's real SAS and Offer buttons. Provision
+    // credentials BEFORE opening any socket (including reverse TCP).
+    let foreground = QtForeground::start()?;
     let guest = settings
         .guest
         .map(|key| {
@@ -287,6 +376,21 @@ pub fn run() -> Result<(), &'static str> {
             }))
         })
         .transpose()?;
+    #[cfg(feature = "kwallet-gpg")]
+    let guest = if settings.kwallet_gpg {
+        let (signer, device) = crate::kwallet_gpg::open_existing().map_err(|_| {
+            "Protected KWallet6 GPG identity absent, locked or backend unsafe. Not listening."
+        })?;
+        let identity = LocalGuestIdentity::from_platform_signer(device, signer)
+            .map_err(|_| "Persistent software P256 identity failed signing-key proof.")?;
+        Some(Arc::new(GuestConfig {
+            identity: Arc::new(identity),
+            admission: Arc::new(Mutex::new(GuestAdmission::new_closed())),
+            live: Arc::new(Mutex::new(None)),
+        }))
+    } else {
+        guest
+    };
     let storage =
         LinuxReceiverStorage::open_private(&settings.private_root, &settings.default_destination)
             .map_err(|_| "Private staging or owner destination directory is unsafe.")?;
@@ -298,7 +402,6 @@ pub fn run() -> Result<(), &'static str> {
         .map_err(|_| "Startup recovery could not inspect private stage state safely.")?;
     // Uncertain CommitIntent and unidentified inventory remain untouched.
     // Never auto-republish, fabricate a receipt or silently delete them.
-    let foreground = QtForeground::start()?;
     foreground.guest_available(guest.is_some());
     if recovery.preserved_unresolved_intent != 0
         || recovery.preserved_unverifiable_destination != 0
@@ -306,24 +409,34 @@ pub fn run() -> Result<(), &'static str> {
     {
         display(b"Unresolved previous transfer: files were preserved for safe recovery.\0");
     }
-    let listener = TcpListener::bind(settings.listen)
-        .map_err(|_| "Could not bind the explicitly selected listening address.")?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|_| "Could not configure the foreground receiver socket.")?;
+    let listener = settings
+        .listen
+        .map(|address| {
+            let listener = TcpListener::bind(address)
+                .map_err(|_| "Could not bind the explicitly selected listening address.")?;
+            listener
+                .set_nonblocking(true)
+                .map_err(|_| "Could not configure the foreground receiver socket.")?;
+            Ok::<_, &'static str>(listener)
+        })
+        .transpose()?;
     let running = Arc::new(AtomicBool::new(true));
     let (events_tx, events_rx) = mpsc::sync_channel::<UiEvent>(4);
     let worker_live = running.clone();
     let worker_guest = guest.clone();
-    let worker = thread::spawn(move || {
-        accept_single_peer(
+    let worker = thread::spawn(move || match (listener, settings.reverse) {
+        (Some(listener), None) => accept_single_peer(
             listener,
             config,
             worker_guest,
             journal_path,
             events_tx,
             worker_live,
-        )
+        ),
+        (None, Some(route)) => {
+            connect_one_foreground_guest(route, worker_guest, journal_path, events_tx, worker_live)
+        }
+        _ => {}
     });
     let mut was_guest_visible = false;
     while foreground.poll() {
@@ -480,6 +593,67 @@ fn accept_single_peer(
                 ));
                 break;
             }
+        }
+    }
+}
+
+/// The owner first presses the native Qt Everyone button; THEN Linux
+/// initiates exactly ONE physical TCP connection to the waiting Android AP.
+/// The accepted stream is processed by the unchanged TLS SERVER /
+/// FILE RECEIVER guest dispatcher. Reconnect for ODGR is a new deliberate
+/// foreground invocation after the Android owner selects exact recovery.
+fn connect_one_foreground_guest(
+    route: DirectWifiRoute,
+    guest: Option<Arc<GuestConfig>>,
+    journal_path: PathBuf,
+    ui: SyncSender<UiEvent>,
+    running: Arc<AtomicBool>,
+) {
+    let Some(guest) = guest else {
+        return;
+    };
+    let _ = ui.try_send(UiEvent::Status(
+        b"Select Everyone on this Linux desktop only after Android is waiting.\0",
+    ));
+    while running.load(Ordering::Acquire) {
+        if guest
+            .admission
+            .lock()
+            .ok()
+            .is_some_and(|admission| !admission.remaining_visibility().is_zero())
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(80));
+    }
+    if !running.load(Ordering::Acquire) {
+        return;
+    }
+    // Runtime cross-check immediately before first SYN, and after connect.
+    match reverse_tcp::connect_exact(&route, &running, false) {
+        Ok(socket) => {
+            let result = guest_runtime::route_connection(
+                socket,
+                None,
+                Some(&guest),
+                &journal_path,
+                &ui,
+                &running,
+            );
+            if result.is_err() {
+                let _ = ui.try_send(UiEvent::Status(
+                    b"Guest/recovery connection failed closed. No automatic retry.\0",
+                ));
+            } else {
+                let _ = ui.try_send(UiEvent::Status(
+                    b"One foreground guest/recovery connection finished.\0",
+                ));
+            }
+        }
+        Err(_) => {
+            let _ = ui.try_send(UiEvent::Status(
+                b"Direct Wi-Fi connector rejected source, route or Android listener.\0",
+            ));
         }
     }
 }

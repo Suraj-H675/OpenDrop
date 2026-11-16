@@ -6,6 +6,9 @@ publish = false
 
 [features]
 hosted-guest-fixture = ["opendrop-core/hosted-guest-fixture"]
+# Opt-in, explicit KDE KWallet6 GPG profile; does not change hardware
+# PKCS11 defaults or automatically choose an installed wallet.
+kwallet-gpg = ["opendrop-core/linux-kwallet-gpg"]
 
 [dependencies]
 opendrop-core = { path = "../../../crates/opendrop-core", features = ["linux-qt-consent"] }
@@ -15,6 +18,8 @@ rustls = { version = "=0.23.45", default-features = false, features = ["std", "r
 rustix = { version = "=1.1.4", features = ["fs", "process"] }
 sha2 = "=0.10.9"
 cryptoki = "=0.12.1"
+libc = "=0.2.190"
+ring = "=0.17.14"
 
 [dev-dependencies]
 tempfile = "=3.27.0"

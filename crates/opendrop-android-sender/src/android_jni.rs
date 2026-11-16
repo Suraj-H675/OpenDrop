@@ -118,7 +118,7 @@ impl AndroidPort {
             .map_err(|_| SendError::Protocol("JNI byte array"))
     }
 
-    fn open_network(&self, host: &str, port: i32) -> Result<TcpStream> {
+    fn open_network(&self, host: &str, port: i32, reverse_tcp: bool) -> Result<TcpStream> {
         let mut env = self
             .vm
             .attach_current_thread()
@@ -129,13 +129,17 @@ impl AndroidPort {
         let descriptor = env
             .call_method(
                 self.bridge.as_obj(),
-                "openLanSocket",
+                if reverse_tcp {
+                    "acceptHotspotSocket"
+                } else {
+                    "openLanSocket"
+                },
                 "(Ljava/lang/String;I)I",
                 &[JValue::Object(&JObject::from(address)), JValue::Int(port)],
             )
             .map_err(|_| {
                 let _ = env.exception_clear();
-                SendError::Protocol("Android rejected LAN route or socket")
+                SendError::Protocol("Android rejected exact LAN peer/interface or socket")
             })?
             .i()
             .map_err(|_| SendError::Protocol("invalid LAN descriptor"))?;
@@ -486,6 +490,7 @@ fn send_one(
     host: &str,
     tcp_port: jint,
     active: Arc<AtomicBool>,
+    reverse_tcp: bool,
 ) -> Result<String> {
     let identity = build_identity(port)?;
     let (length, digest) = {
@@ -493,7 +498,7 @@ fn send_one(
         prehash_source(&mut input, (size >= 0).then_some(size as u64))?
     };
     let offered = prepare_offer(&identity, name, length, digest)?;
-    let socket = port.open_network(host, tcp_port)?;
+    let socket = port.open_network(host, tcp_port, reverse_tcp)?;
     let pairing = connect_guest(socket, &identity, active)?;
     let _ui = OwnerScope::enter(port.clone());
     let authenticated = pairing.confirm_in_android_owner_ui()?;
@@ -512,6 +517,7 @@ fn recover_one(
     host: &str,
     tcp_port: jint,
     active: Arc<AtomicBool>,
+    reverse_tcp: bool,
 ) -> Result<String> {
     let identity = build_identity(port)?;
     let mut data = port.read_recovery(id)?;
@@ -521,7 +527,7 @@ fn recover_one(
     if record.transfer_id().as_str() != id {
         return Err(SendError::Protocol("wrong recovery record ID"));
     }
-    let socket = port.open_network(host, tcp_port)?;
+    let socket = port.open_network(host, tcp_port, reverse_tcp)?;
     let receipt = recover_committed(socket, &identity, &record, active)?;
     port.finish_recovery(id)?;
     Ok(format!("RECOVERED:{}", receipt.transfer_id.as_str()))
@@ -553,6 +559,33 @@ pub extern "system" fn Java_org_opendrop_app_GuestNative_sendOne(
     host: JString,
     port: jint,
 ) -> jstring {
+    jni_send_one(env, bridge, index, name, declared_size, host, port, false)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opendrop_app_GuestNative_sendHotspot(
+    env: JNIEnv,
+    _receiver: JClass,
+    bridge: JObject,
+    index: jint,
+    name: JString,
+    declared_size: jlong,
+    host: JString,
+    port: jint,
+) -> jstring {
+    jni_send_one(env, bridge, index, name, declared_size, host, port, true)
+}
+
+fn jni_send_one(
+    mut env: JNIEnv,
+    bridge: JObject,
+    index: jint,
+    name: JString,
+    declared_size: jlong,
+    host: JString,
+    port: jint,
+    reverse_tcp: bool,
+) -> jstring {
     let result = (|| -> Result<String> {
         let active = ActiveSession::begin()?;
         let name: String = env
@@ -572,6 +605,7 @@ pub extern "system" fn Java_org_opendrop_app_GuestNative_sendOne(
             &host,
             port,
             active.0.clone(),
+            reverse_tcp,
         )
     })();
     reply(&mut env, result)
@@ -586,6 +620,29 @@ pub extern "system" fn Java_org_opendrop_app_GuestNative_recoverOne(
     host: JString,
     port: jint,
 ) -> jstring {
+    jni_recover_one(env, bridge, id, host, port, false)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opendrop_app_GuestNative_recoverHotspot(
+    env: JNIEnv,
+    _receiver: JClass,
+    bridge: JObject,
+    id: JString,
+    host: JString,
+    port: jint,
+) -> jstring {
+    jni_recover_one(env, bridge, id, host, port, true)
+}
+
+fn jni_recover_one(
+    mut env: JNIEnv,
+    bridge: JObject,
+    id: JString,
+    host: JString,
+    port: jint,
+    reverse_tcp: bool,
+) -> jstring {
     let result = (|| -> Result<String> {
         let active = ActiveSession::begin()?;
         let id: String = env
@@ -597,7 +654,7 @@ pub extern "system" fn Java_org_opendrop_app_GuestNative_recoverOne(
             .map_err(|_| SendError::Protocol("JNI host"))?
             .into();
         let bridge = AndroidPort::new(&mut env, bridge)?;
-        recover_one(&bridge, &id, &host, port, active.0.clone())
+        recover_one(&bridge, &id, &host, port, active.0.clone(), reverse_tcp)
     })();
     reply(&mut env, result)
 }

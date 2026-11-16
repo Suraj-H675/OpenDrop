@@ -13,6 +13,8 @@
 compile_error!("hosted-guest-fixture is forbidden for production release builds");
 
 mod guest_signer;
+#[cfg(feature = "kwallet-gpg")]
+mod kwallet_gpg;
 mod runtime;
 
 fn main() {
