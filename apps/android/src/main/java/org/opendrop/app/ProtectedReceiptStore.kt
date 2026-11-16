@@ -107,10 +107,19 @@ internal class ProtectedReceiptStore(context: Context) {
         return prefs.all.keys.asSequence()
             .filter { it.startsWith("sealed:") }
             .map { it.removePrefix("sealed:") }
-            .filter { validId(it) && prefs.getLong("until:$it", 0L) > now }
-            .sortedWith(compareBy<String> { prefs.getLong("until:$it", Long.MAX_VALUE) }
+            // Corrupt metadata for ONE transfer must not break enumeration
+            // of every other legitimate pending transfer.
+            .filter { validId(it) &&
+                runCatching { prefs.getLong("until:$it", 0L) }.getOrNull()
+                    ?.let { expires -> expires > now } == true }
+            .sortedWith(compareBy<String> {
+                runCatching { prefs.getLong("until:$it", Long.MAX_VALUE) }
+                    .getOrDefault(Long.MAX_VALUE)
+            }
                 .thenBy { it })
-            .take(MAX_PENDING)
+            // Legacy pre-S1F installs may hold MORE than 16 records. Never
+            // silently hide those: enumerate all existing IDs while refusing
+            // any new writes until capacity has been resolved by the owner.
             .toList()
     }
 
@@ -124,7 +133,8 @@ internal class ProtectedReceiptStore(context: Context) {
         val now = System.currentTimeMillis()
         prefs.all.keys.filter { it.startsWith("until:") }.forEach { entry ->
             val id = entry.removePrefix("until:")
-            if (validId(id) && prefs.getLong(entry, 0) <= now) clearRecovery(id)
+            val expires = runCatching { prefs.getLong(entry, 0) }.getOrNull()
+            if (validId(id) && expires != null && expires <= now) clearRecovery(id)
         }
     }
 }

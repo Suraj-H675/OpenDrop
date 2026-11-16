@@ -23,7 +23,15 @@ if grep -E 'android.permission.(INTERNET|ACCESS_NETWORK_STATE|READ_EXTERNAL_STOR
 fi
 "$toolsdir/apksigner" verify --verbose --print-certs "$apk" > "$RUNNER_TEMP/s1f-signer-report.txt"
 grep -F 'Verified using v2 scheme (APK Signature Scheme v2): true' "$RUNNER_TEMP/s1f-signer-report.txt"
-cert="$(grep -m1 'Signer #1 certificate SHA-256 digest:' "$RUNNER_TEMP/s1f-signer-report.txt" | sed 's/.*digest: //')"
+# Android Build Tools releases differ in capitalization and whether the
+# certificate digest is colon-delimited. Print ONLY the PUBLIC certificate
+# digest report for inspection, normalize hex and refuse non-256bit values.
+grep -iE '(certificate.*SHA-256|SHA-256.*certificate)' "$RUNNER_TEMP/s1f-signer-report.txt" || {
+  echo "Signing certificate fingerprint not reported by apksigner" >&2
+  exit 1
+}
+raw="$(grep -im1 -E '(certificate.*SHA-256|SHA-256.*certificate)' "$RUNNER_TEMP/s1f-signer-report.txt")"
+cert="$(printf '%s\n' "$raw" | sed -E 's/.*[Dd]igest: *//' | tr -cd '0-9a-fA-F' | tr 'A-F' 'a-f')"
 test "${#cert}" -eq 64
 unzip -l "$apk" | grep -F 'lib/arm64-v8a/libopendrop_android_guest.so'
 if unzip -l "$apk" | grep -E '(lib/.*\.so)' | grep -v -F 'libopendrop_android_guest.so'; then

@@ -188,6 +188,10 @@ class GuestRuntimeInstrumentation : Instrumentation() {
             "tampered AES-GCM must fail")
         requireTest(receipts.pendingIds().containsAll(listOf(secondId, thirdId)),
             "one corrupt receipt cannot hide unrelated pending receipts")
+        requireTest(prefs.edit().putString("until:$recordId", "corrupt-expiry").commit(),
+            "test-only corrupt one receipt metadata")
+        requireTest(receipts.pendingIds().containsAll(listOf(secondId, thirdId)),
+            "one corrupt receipt metadata cannot hide unrelated pending receipts")
         requireTest(receipts.clearRecovery(thirdId) &&
             receipts.pendingIds().toSet() == setOf(recordId, secondId),
             "clearing newest does not hide earlier unresolved receipts")
