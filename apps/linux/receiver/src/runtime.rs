@@ -301,12 +301,18 @@ impl Settings {
         {
             return Err("Only absolute owner-controlled directories are allowed.");
         }
-        if guest_ephemeral_once && private_root.join("journal.sqlite").exists() {
-            // D-135 cannot infer that a pre-existing journal corresponds
-            // to an abandoned locked protected profile. New one-time
-            // sessions need a NEW isolated private staging root; never
-            // silently inherit existing identity/recovery history.
-            return Err("One-time guest requires a fresh private session root; existing identity/journal cannot be downgraded.");
+        if guest_ephemeral_once {
+            // The app cannot deduce a missing/locked protected identity from
+            // the absence of one particular journal filename. Require a
+            // previously created but completely EMPTY isolated session root.
+            // Any saved identity, journal, entry, or corrupted/unreadable
+            // directory means STOP, never a silent D-135 downgrade.
+            let mut entries = std::fs::read_dir(&private_root).map_err(|_| {
+                "One-time guest requires an existing, readable, isolated private session root."
+            })?;
+            if entries.next().is_some() {
+                return Err("One-time guest requires an empty isolated session root; existing identity or receipt state cannot be inherited.");
+            }
         }
         Ok(Some(Self {
             listen,
@@ -1042,6 +1048,50 @@ mod tests {
         let last = partial.len() - 1;
         partial[last] = "peer-provided-ID";
         assert!(args(&partial).is_err());
+    }
+
+    #[test]
+    fn one_time_profile_is_explicit_and_refuses_existing_or_ambiguous_identity_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("one-time");
+        let destination = dir.path().join("destination");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let private_text = private.to_str().unwrap();
+        let destination_text = destination.to_str().unwrap();
+        let base = [
+            "--nearby",
+            "auto",
+            "--private-root",
+            private_text,
+            "--destination",
+            destination_text,
+        ];
+        assert!(args(&base).is_err());
+        let mut requested = base.to_vec();
+        requested.extend(["--guest-ephemeral-once", "explicit"]);
+        let profile = args(&requested).unwrap().unwrap();
+        assert!(profile.guest_ephemeral_once && profile.nearby);
+        assert!(profile.guest.is_none() && profile.tls_identity_root.is_none());
+        let mut protected = requested.clone();
+        protected.extend(["--tls-identity-root", "/owner/protected-identity"]);
+        assert!(args(&protected).is_err());
+        let mut hardware = requested.clone();
+        hardware.extend(["--guest-pkcs11-module", "/usr/lib/pkcs11/verified.so"]);
+        assert!(args(&hardware).is_err());
+        let mut wallet = requested.clone();
+        wallet.extend(["--guest-kwallet-gpg", "explicit"]);
+        assert!(args(&wallet).is_err());
+        let mut wrong_choice = base.to_vec();
+        wrong_choice.extend(["--guest-ephemeral-once", "automatic"]);
+        assert!(args(&wrong_choice).is_err());
+        // An interrupted, locked or lost prior installation cannot be
+        // interpreted as a new session just because journal.sqlite is gone.
+        std::fs::write(private.join(".existing-protected-identity"), b"sentinel").unwrap();
+        assert!(args(&requested).is_err());
+        std::fs::remove_file(private.join(".existing-protected-identity")).unwrap();
+        std::fs::write(private.join("journal.sqlite"), b"not-a-valid-db").unwrap();
+        assert!(args(&requested).is_err());
     }
 
     #[test]

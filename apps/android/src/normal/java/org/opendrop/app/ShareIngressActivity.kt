@@ -7,8 +7,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import android.os.Handler
-import android.os.Looper
+import android.os.SystemClock
 
 /** Small functional foreground sender. Android's OS supplies the source URI
  * grants; the only production transfer path is the Rust guest engine.
@@ -25,8 +24,11 @@ class ShareIngressActivity : Activity() {
     private lateinit var send: Button
     private lateinit var recover: Button
     private var discovery: NearbyLocalDiscovery? = null
-    private val nearby = linkedMapOf<String, NearbyLocalWire.Candidate>()
-    private val main = Handler(Looper.getMainLooper())
+    private data class SeenCandidate(
+        val candidate: NearbyLocalWire.Candidate,
+        val observedAtMs: Long,
+    )
+    private val nearby = linkedMapOf<String, SeenCandidate>()
     private var sources: List<SharedFile> = emptyList()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -105,7 +107,8 @@ class ShareIngressActivity : Activity() {
                 onCandidate = { candidate ->
                     runOnUiThread {
                         if (!isFinishing && !isDestroyed) {
-                            nearby[candidate.address.hostAddress + ":" + candidate.port] = candidate
+                            nearby[candidate.address.hostAddress + ":" + candidate.port] =
+                                SeenCandidate(candidate, SystemClock.elapsedRealtime())
                             while (nearby.size > 16) nearby.remove(nearby.keys.first())
                             updateStatus("${nearby.size} nearby candidate(s). " +
                                 "Choose a recipient, then compare the ten-digit code on both devices.")
@@ -124,7 +127,10 @@ class ShareIngressActivity : Activity() {
 
     private fun chooseRecipient(recoveryId: String?) {
         if (sending || isFinishing || isDestroyed) return
+        val now = SystemClock.elapsedRealtime()
+        nearby.entries.removeAll { now - it.value.observedAtMs > 12_000L }
         val candidates = nearby.values
+            .map { it.candidate }
             .filter { it.role == NearbyLocalWire.receiverListener }
             .distinctBy { it.address.hostAddress + ":" + it.port }
         if (candidates.isEmpty()) {
@@ -252,7 +258,8 @@ class ShareIngressActivity : Activity() {
         val next = NearbyLocalDiscovery(this, { candidate ->
             runOnUiThread {
                 if (!isFinishing && !isDestroyed && !sending)
-                    nearby[candidate.address.hostAddress + ":" + candidate.port] = candidate
+                    nearby[candidate.address.hostAddress + ":" + candidate.port] =
+                        SeenCandidate(candidate, SystemClock.elapsedRealtime())
             }
         }, { updateStatus("Local discovery unavailable. No automatic WAN fallback.") })
         discovery = next

@@ -93,25 +93,25 @@ class GuestRuntimeInstrumentation : Instrumentation() {
 
         checkpoint = "portable-nearby-discovery-role-and-untrusted-source"
         val client = InetAddress.getByName("10.34.80.141") as Inet4Address
-        val receiver = InetAddress.getByName("10.34.80.134") as Inet4Address
+        val receiverAddress = InetAddress.getByName("10.34.80.134") as Inet4Address
         val packet = NearbyLocalWire.encode(NearbyLocalWire.receiverListener)
         requireTest(packet.size == 24 &&
             packet.sliceArray(0..7).contentEquals(byteArrayOf(
                 0x4f, 0x44, 0x4e, 0x42, 1, 1, 0xab.toByte(), 0xd7.toByte()
             )), "native packet and portable Rust vector match")
         requireTest(NearbyLocalWire.parse(
-            packet, packet.size, receiver, client, 24
+            packet, packet.size, receiverAddress, client, 24
         )?.role == NearbyLocalWire.receiverListener, "permitted source-scoped receiver candidate")
         val changedRole = packet.copyOf().apply { this[5] = 99 }
         requireTest(NearbyLocalWire.parse(
-            changedRole, changedRole.size, receiver, client, 24
+            changedRole, changedRole.size, receiverAddress, client, 24
         ) == null, "untrusted role rejected")
         val wrongSubnet = InetAddress.getByName("10.35.80.134")
         requireTest(NearbyLocalWire.parse(
             packet, packet.size, wrongSubnet, client, 24
         ) == null, "remote/WAN or wrong-subnet discovery rejected")
         requireTest(NearbyLocalWire.parse(
-            packet, packet.size - 1, receiver, client, 24
+            packet, packet.size - 1, receiverAddress, client, 24
         ) == null, "truncated discovery rejected")
         requireTest(NearbyLocalWire.directedBroadcast(client, 24).hostAddress == "10.34.80.255",
             "correct private directed broadcast and no default route")
