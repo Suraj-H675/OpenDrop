@@ -131,6 +131,12 @@ pub(super) fn connect_exact(
     running: &AtomicBool,
     test_loopback: bool,
 ) -> io::Result<TcpStream> {
+    if !running.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "owner cancelled before TCP initiation",
+        ));
+    }
     route.validate(test_loopback)?;
     let device = CString::new(route.interface.as_str())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad interface"))?;
@@ -177,6 +183,12 @@ pub(super) fn connect_exact(
         return Err(io::Error::last_os_error());
     }
     let peer = sockaddr(*route.peer.ip(), route.peer.port());
+    if !running.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "owner revoked before TCP initiation",
+        ));
+    }
     let code = unsafe {
         libc::connect(
             fd.0,
@@ -284,5 +296,45 @@ mod tests {
             peer: SocketAddrV4::new("8.8.8.8".parse().unwrap(), 43991),
         };
         assert!(route.validate(false).is_err());
+    }
+
+    #[test]
+    fn absent_interface_and_wrong_source_deny_before_opening_socket() {
+        let wrong_interface = DirectWifiRoute {
+            interface: "opendrop-unavailable-interface".into(),
+            source: "10.5.9.20".parse().unwrap(),
+            peer: SocketAddrV4::new("10.5.9.21".parse().unwrap(), 43991),
+        };
+        assert!(wrong_interface.validate(false).is_err());
+
+        let wrong_source = DirectWifiRoute {
+            interface: "lo".into(),
+            source: "10.5.9.20".parse().unwrap(),
+            peer: SocketAddrV4::new("10.5.9.21".parse().unwrap(), 43991),
+        };
+        assert!(wrong_source.validate(false).is_err());
+        let same_host = DirectWifiRoute {
+            interface: "lo".into(),
+            source: "10.5.9.20".parse().unwrap(),
+            peer: SocketAddrV4::new("10.5.9.20".parse().unwrap(), 43991),
+        };
+        assert!(same_host.validate(false).is_err());
+    }
+
+    #[test]
+    fn revoked_connector_attempt_makes_no_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let route = DirectWifiRoute {
+            interface: "lo".into(),
+            source: Ipv4Addr::LOCALHOST,
+            peer: SocketAddrV4::new(Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port()),
+        };
+        let cancelled = AtomicBool::new(false);
+        assert!(connect_exact(&route, &cancelled, true).is_err());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 }

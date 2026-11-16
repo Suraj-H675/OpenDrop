@@ -24,7 +24,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/verification/s1g-reverse-20261116
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$GITHUB_SHA"
           test ! -e AGENTS.md && test ! -e .opendrop-private
       - name: Rust stable and disposable Qt6 native dependencies
         shell: bash
@@ -70,13 +70,17 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/verification/s1g-reverse-20261116
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          # Container checkout bind mount may be root-owned; trust ONLY
+          # this exact disposable runner checkout for SHA verification.
+          test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$GITHUB_SHA"
           test ! -e AGENTS.md && test ! -e .opendrop-private
           # NEVER open a wallet or spawn GPG agent in hosted CI. Only
           # compile production KWallet6 integration and use in-memory Rust
           # cryptographic vectors in #[cfg(test)].
-          cargo test -p opendrop-linux-receiver --bin opendrop-linux-receiver +            --features kwallet-gpg --locked
-          cargo build -p opendrop-linux-receiver --bin opendrop-linux-receiver +            --features kwallet-gpg --locked
+          cargo test -p opendrop-linux-receiver --bin opendrop-linux-receiver \
+            --features kwallet-gpg --locked
+          cargo build -p opendrop-linux-receiver --bin opendrop-linux-receiver \
+            --features kwallet-gpg --locked
 
   android-arm64-art-provenance:
     runs-on: ubuntu-24.04
