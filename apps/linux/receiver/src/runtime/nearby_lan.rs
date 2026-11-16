@@ -102,7 +102,7 @@ pub(super) fn detect_one_physical_link() -> io::Result<LocalLink> {
     Ok(candidates.into_iter().next().expect("one checked"))
 }
 
-fn bind_one_interface(socket: &UdpSocket, link: &LocalLink) -> io::Result<()> {
+pub(super) fn bind_one_interface(socket: &UdpSocket, link: &LocalLink) -> io::Result<()> {
     let device = CString::new(link.interface.as_str())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid network interface"))?;
     if unsafe {
@@ -120,7 +120,7 @@ fn bind_one_interface(socket: &UdpSocket, link: &LocalLink) -> io::Result<()> {
     Ok(())
 }
 
-fn directed_broadcast(link: &LocalLink) -> Ipv4Addr {
+pub(super) fn directed_broadcast(link: &LocalLink) -> Ipv4Addr {
     let mask = u32::MAX << (32 - link.prefix);
     Ipv4Addr::from(u32::from(link.source) | !mask)
 }
@@ -131,6 +131,89 @@ fn directed_broadcast(link: &LocalLink) -> Ipv4Addr {
 /// A single physical session wins, and no automatic retry/replay occurs.
 pub(super) fn wait_for_nearby_transfer(running: &AtomicBool) -> io::Result<TcpStream> {
     let link = detect_one_physical_link()?;
+    wait_on_link(
+        running,
+        link,
+        LinkKind::ProductionPhysical,
+        SESSION_DISCOVERY_DEADLINE,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum LinkKind {
+    ProductionPhysical,
+    // Compiled ONLY in debug builds with the explicitly enabled hosted
+    // fixture feature. The production executable rejects that feature.
+    #[cfg(all(feature = "hosted-guest-fixture", debug_assertions))]
+    IsolatedCiVeth,
+}
+
+#[cfg(all(test, feature = "hosted-guest-fixture", debug_assertions))]
+pub(super) fn wait_for_hosted_netns(
+    running: &AtomicBool,
+    link: LocalLink,
+    deadline: Duration,
+) -> io::Result<TcpStream> {
+    validate_hosted_netns_link(&link)?;
+    wait_on_link(running, link, LinkKind::IsolatedCiVeth, deadline)
+}
+
+#[cfg(all(test, feature = "hosted-guest-fixture", debug_assertions))]
+pub(super) fn validate_hosted_netns_link(link: &LocalLink) -> io::Result<()> {
+    // A test-only supplied local address does NOT supply a peer/candidate.
+    // Verify that the declared veth actually exists, is up, and owns the
+    // address and prefix in this network namespace. The production detector
+    // never accepts this interface class.
+    use std::process::Command;
+    if !link.interface.starts_with("od148")
+        || !private(link.source)
+        || !(16..=30).contains(&link.prefix)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "not a D148 CI link",
+        ));
+    }
+    let output = Command::new("ip")
+        .args(["-o", "-4", "addr", "show", "dev", &link.interface])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "hosted link absent",
+        ));
+    }
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "interface encoding"))?;
+    if !text.contains(&format!("inet {}/{} ", link.source, link.prefix)) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "wrong hosted interface address/prefix",
+        ));
+    }
+    let link_info = Command::new("ip")
+        .args(["-o", "link", "show", "dev", &link.interface])
+        .output()?;
+    let link_flags = String::from_utf8_lossy(&link_info.stdout);
+    if !link_info.status.success()
+        || !link_flags.contains(",UP,")
+            && !link_flags.contains("<UP,")
+            && !link_flags.contains(",UP>")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "hosted link down",
+        ));
+    }
+    Ok(())
+}
+
+fn wait_on_link(
+    running: &AtomicBool,
+    link: LocalLink,
+    kind: LinkKind,
+    deadline: Duration,
+) -> io::Result<TcpStream> {
     let tcp = TcpListener::bind(SocketAddrV4::new(link.source, NEARBY_TCP_PORT))?;
     tcp.set_nonblocking(true)?;
     // UDP wildcard is *device-bound* using SO_BINDTODEVICE. In contrast,
@@ -146,13 +229,19 @@ pub(super) fn wait_for_nearby_transfer(running: &AtomicBool) -> io::Result<TcpSt
     let started = Instant::now();
     let mut next_announcement = Instant::now();
     let mut attempts = 0u32;
-    while running.load(Ordering::Acquire) && started.elapsed() < SESSION_DISCOVERY_DEADLINE {
+    while running.load(Ordering::Acquire) && started.elapsed() < deadline {
         // Recheck link and allow owner cancellation BEFORE any SYN or beacon.
-        if detect_one_physical_link()? != link {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "LAN link changed",
-            ));
+        match kind {
+            LinkKind::ProductionPhysical => {
+                if detect_one_physical_link()? != link {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "LAN link changed",
+                    ));
+                }
+            }
+            #[cfg(all(feature = "hosted-guest-fixture", debug_assertions))]
+            LinkKind::IsolatedCiVeth => validate_hosted_netns_link(&link)?,
         }
         if Instant::now() >= next_announcement {
             // A broadcast failure must not trigger a WAN or DNS fallback.
@@ -205,7 +294,13 @@ pub(super) fn wait_for_nearby_transfer(running: &AtomicBool) -> io::Result<TcpSt
                     source: link.source,
                     peer: candidate.peer,
                 };
-                return connect_exact(&route, running, false);
+                return connect_exact(&route, running, {
+                    match kind {
+                        LinkKind::ProductionPhysical => false,
+                        #[cfg(all(feature = "hosted-guest-fixture", debug_assertions))]
+                        LinkKind::IsolatedCiVeth => true,
+                    }
+                });
             }
             Ok(_) => {}
             Err(e)

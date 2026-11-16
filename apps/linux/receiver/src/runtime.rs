@@ -34,6 +34,8 @@ const IO_TICK: Duration = Duration::from_millis(250);
 const MAX_TRANSFER_FRAMES: usize = 131_072;
 
 type TlsTransport = StreamOwned<ServerConnection, TcpStream>;
+#[cfg(all(test, feature = "hosted-guest-fixture", debug_assertions))]
+mod d148_netns_fixture;
 mod guest_runtime;
 mod nearby_lan;
 mod reverse_tcp;
