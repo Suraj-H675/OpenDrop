@@ -42,25 +42,32 @@ jobs:
           set -euo pipefail
           cargo fmt --all -- --check
           cargo test -p opendrop-linux-receiver --bin opendrop-linux-receiver             --features hosted-guest-fixture --locked --no-run --message-format=json             > "$RUNNER_TEMP/d148-cargo-fixtures.jsonl"
-          python3 - "$GITHUB_ENV" <<'PYBIN'
-          import os,pathlib,subprocess,sys
-          # Cargo also emits build-script / CMake artifacts. Selecting by
-          # target name alone can accidentally execute a build helper.
-          # Require the REAL test harness to list both exact D148 tests.
+          python3 - "$RUNNER_TEMP/d148-cargo-fixtures.jsonl" "$GITHUB_ENV" <<'PYBIN'
+          import json,os,pathlib,subprocess,sys
+          # Do NOT assume a runner's Cargo target directory is ./target.
+          # Inspect actual Cargo compiler-artifact executable paths and
+          # prove --list includes BOTH test-only process endpoints before
+          # ever granting a disposable network namespace.
+          artifacts=[json.loads(line) for line in open(sys.argv[1]) if line.startswith('{')]
+          binaries=list(dict.fromkeys(x['executable'] for x in artifacts
+              if x.get('reason')=='compiler-artifact' and x.get('executable')))
           candidates=[]
-          for path in pathlib.Path("target/debug/deps").glob("opendrop_linux_receiver-*"):
-            if not path.is_file() or not os.access(path,os.X_OK):
-              continue
+          for candidate in binaries:
+            path=pathlib.Path(candidate)
+            if not path.is_file() or not os.access(path,os.X_OK): continue
             with path.open('rb') as source:
               if source.read(4)!=b'\x7fELF': continue
-            listed=subprocess.run([str(path),'--list'],capture_output=True,
-                                  text=True,timeout=10,check=True)
-            if all(name in listed.stdout for name in (
+            result=subprocess.run([str(path),'--list'],capture_output=True,
+                                   text=True,timeout=10,check=False)
+            if result.returncode!=0: continue
+            if all(name in result.stdout for name in (
               'runtime::d148_netns_fixture::hosted_receiver_process_real_udp_tcp_tls_file',
               'runtime::d148_netns_fixture::hosted_sender_process_real_udp_tcp_tls_file')):
               candidates.append(path.resolve())
-          assert len(candidates)==1,candidates
-          with open(sys.argv[1],'a') as out:
+          print('D148_CARGO_ELF_ARTIFACTS_COUNT='+str(len(binaries)))
+          assert len(candidates)==1,{'valid_test_harnesses':candidates,
+                                      'cargo_artifacts':binaries}
+          with open(sys.argv[2],'a') as out:
             out.write('D148_TEST_BINARY='+str(candidates[0])+'\n')
           print('D148_REAL_TEST_HARNESS_BINARY='+str(candidates[0]))
           PYBIN
