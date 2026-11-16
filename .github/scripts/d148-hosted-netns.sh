@@ -9,7 +9,9 @@ if [[ "$GITHUB_ACTIONS" != true || "$RUNNER_OS" != Linux ||
 fi
 test "$(id -u)" -ne 0
 test -s "$D148_TEST_BINARY"
-user="$(id -un)"
+uid="$(id -u)"
+gid="$(id -g)"
+test -x "$(command -v setpriv)"
 base="$(mktemp -d "$RUNNER_TEMP/opendrop-d148.XXXXXXXX")"
 chmod 700 "$base"
 na=od148rx
@@ -58,12 +60,12 @@ setup() {
 }
 receiver() {
   local scenario="$1" root="$2" out="$3"
-  timeout --kill-after=3s 40s sudo ip netns exec "$na" sudo -u "$user" +    env D148_FIXTURE_CI=isolate-only D148_SCENARIO="$scenario" +    D148_INTERFACE="$ia" D148_LOCAL_IPV4="$ip_a" D148_LOCAL_PREFIX=24 +    D148_RECEIVER_ROOT="$root" "$D148_TEST_BINARY" +    --exact runtime::d148_netns_fixture::hosted_receiver_process_real_udp_tcp_tls_file +    --ignored --nocapture --test-threads=1 >"$out" 2>&1 &
+  timeout --kill-after=3s 40s sudo ip netns exec "$na" setpriv --reuid="$uid" --regid="$gid" --clear-groups env D148_FIXTURE_CI=isolate-only D148_SCENARIO="$scenario" D148_INTERFACE="$ia" D148_LOCAL_IPV4="$ip_a" D148_LOCAL_PREFIX=24 D148_RECEIVER_ROOT="$root" "$D148_TEST_BINARY" --exact runtime::d148_netns_fixture::hosted_receiver_process_real_udp_tcp_tls_file --ignored --nocapture --test-threads=1 >"$out" 2>&1 &
   rx_pid=$!
 }
 sender() {
   local scenario="$1" out="$2"
-  timeout --kill-after=3s 40s sudo ip netns exec "$nb" sudo -u "$user" +    env D148_FIXTURE_CI=isolate-only D148_SCENARIO="$scenario" +    D148_INTERFACE="$ib" D148_LOCAL_IPV4="$ip_b" D148_LOCAL_PREFIX=24 +    "$D148_TEST_BINARY" +    --exact runtime::d148_netns_fixture::hosted_sender_process_real_udp_tcp_tls_file +    --ignored --nocapture --test-threads=1 >"$out" 2>&1 &
+  timeout --kill-after=3s 40s sudo ip netns exec "$nb" setpriv --reuid="$uid" --regid="$gid" --clear-groups env D148_FIXTURE_CI=isolate-only D148_SCENARIO="$scenario" D148_INTERFACE="$ib" D148_LOCAL_IPV4="$ip_b" D148_LOCAL_PREFIX=24 "$D148_TEST_BINARY" --exact runtime::d148_netns_fixture::hosted_sender_process_real_udp_tcp_tls_file --ignored --nocapture --test-threads=1 >"$out" 2>&1 &
   tx_pid=$!
 }
 positive_assert() {
@@ -107,7 +109,7 @@ run_case() {
   elif [[ "$scenario" != blocked && "$scenario" != cancel ]]; then
     if [[ "$scenario" == normal ]]; then
       # Real UDP spoofed candidates cross from the peer namespace.
-      sudo ip netns exec "$nb" sudo -u "$user" python3 - <<PY
+      sudo ip netns exec "$nb" setpriv --reuid="$uid" --regid="$gid" --clear-groups python3 - <<PY
 import socket
 s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
 s.setsockopt(socket.SOL_SOCKET,socket.SO_BROADCAST,1)
