@@ -21,12 +21,24 @@ ip_b=10.251.42.12
 rx_pid=""
 tx_pid=""
 clean() {
-  if [[ -n "$tx_pid" ]]; then kill "$tx_pid" 2>/dev/null; wait "$tx_pid" 2>/dev/null; tx_pid=""; fi
-  if [[ -n "$rx_pid" ]]; then kill "$rx_pid" 2>/dev/null; wait "$rx_pid" 2>/dev/null; rx_pid=""; fi
+  if [[ -n "$tx_pid" ]]; then kill "$tx_pid" 2>/dev/null || true; wait "$tx_pid" 2>/dev/null || true; tx_pid=""; fi
+  if [[ -n "$rx_pid" ]]; then kill "$rx_pid" 2>/dev/null || true; wait "$rx_pid" 2>/dev/null || true; rx_pid=""; fi
   sudo ip netns delete "$na" 2>/dev/null || true
   sudo ip netns delete "$nb" 2>/dev/null || true
 }
-trap clean EXIT
+on_exit() {
+  local code=$?
+  if [[ "$code" -ne 0 ]]; then
+    for f in "$base"/*-rx.log "$base"/*-tx.log; do
+      if [[ -f "$f" ]]; then
+        echo "D148_SCOPED_FAILURE_LOG=$f" >&2
+        tail -n 85 "$f" >&2
+      fi
+    done
+  fi
+  clean
+}
+trap on_exit EXIT
 setup() {
   clean
   sudo ip netns add "$na"
