@@ -78,8 +78,10 @@ positive_assert() {
   grep -q D148_SENDER_AUTHENTICATED_COMPLETE "$tx"
   grep -q D148_RECEIVER_COMMITTED "$rx"
   local code1 code2
-  code1="$(grep -oE 'D148_RECEIVER_SAS=[0-9]{10}' "$rx" | tail -1 | cut -d= -f2)"
-  code2="$(grep -oE 'D148_SENDER_SAS=[0-9]{10}' "$tx" | tail -1 | cut -d= -f2)"
+  # The real ten-digit SAS is rendered as 5 digits, a hyphen, then 5
+  # digits; do NOT change production UI to satisfy a test-log parser.
+  code1="$(grep -oE 'D148_RECEIVER_SAS=[0-9]{5}-[0-9]{5}' "$rx" | tail -1 | cut -d= -f2)"
+  code2="$(grep -oE 'D148_SENDER_SAS=[0-9]{5}-[0-9]{5}' "$tx" | tail -1 | cut -d= -f2)"
   test -n "$code1" && test "$code1" = "$code2"
   python3 - "$root/destination/d148-synthetic.bin" "$root/private/journal.sqlite" "$tx" "$rx" <<'PY'
 import hashlib,sqlite3,sys
