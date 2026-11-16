@@ -5,7 +5,8 @@
          normal sender UI, Java network bridge and JNI entry points. -->
     <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove" />
-    <application android:label="OpenDrop · OFFLINE TEST">
+    <application android:label="OpenDrop · OFFLINE TEST"
+        tools:replace="android:label">
         <activity
             android:name="org.opendrop.app.OfflineSmokeActivity"
             android:exported="true"
