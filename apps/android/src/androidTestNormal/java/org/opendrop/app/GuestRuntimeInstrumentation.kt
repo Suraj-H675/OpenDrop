@@ -193,8 +193,9 @@ class GuestRuntimeInstrumentation : Instrumentation() {
         requireTest(receipts.pendingIds().containsAll(listOf(secondId, thirdId)),
             "one corrupt receipt metadata cannot hide unrelated pending receipts")
         requireTest(receipts.clearRecovery(thirdId) &&
-            receipts.pendingIds().toSet() == setOf(recordId, secondId),
-            "clearing newest does not hide earlier unresolved receipts")
+            receipts.pendingIds() == listOf(secondId) &&
+            prefs.contains("sealed:$recordId"),
+            "clearing newest preserves the earlier valid receipt and does not discard the corrupt one")
         requireTest(receipts.unsealRecovery(secondId)?.contentEquals(ByteArray(32) { 11 }) == true,
             "older original receipt remains independently decryptable")
         requireTest(receipts.clearRecovery(recordId),
