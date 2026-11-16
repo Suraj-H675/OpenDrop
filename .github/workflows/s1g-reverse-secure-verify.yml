@@ -58,7 +58,10 @@ jobs:
       - name: Install native CI-only KDE development dependencies
         run: |
           set -euo pipefail
-          dnf -y --setopt=install_weak_deps=False install +            git rust cargo rustfmt gcc gcc-c++ clang make cmake +            pkgconf-pkg-config qt6-qtbase-devel kf6-kwallet-devel +            systemd-devel openssl-devel
+          dnf -y --setopt=install_weak_deps=False install \
+            git rust cargo rustfmt gcc gcc-c++ clang make cmake \
+            pkgconf-pkg-config qt6-qtbase-devel kf6-kwallet-devel \
+            systemd-devel openssl-devel
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false

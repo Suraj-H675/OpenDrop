@@ -236,7 +236,6 @@ class AndroidGuestBridge(
     }
 
     @Synchronized
-    @Synchronized
     private fun closeNetwork() {
         runCatching { connectingSocket?.close() }
         runCatching { activeSocket?.close() }
