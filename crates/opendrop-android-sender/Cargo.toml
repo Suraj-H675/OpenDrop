@@ -9,6 +9,9 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 hosted-guest-fixture = ["opendrop-core/hosted-guest-fixture"]
+# Build an OS-enforced OFFLINE diagnostic JNI binary. No sender, recovery,
+# TCP, TLS connector, or user approval JNI entry points are compiled.
+offline-smoke = []
 
 [dependencies]
 opendrop-core = { path = "../opendrop-core" }

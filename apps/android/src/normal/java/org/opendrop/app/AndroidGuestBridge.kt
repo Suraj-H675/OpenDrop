@@ -45,6 +45,7 @@ class AndroidGuestBridge(
     fun unsealRecovery(id: String): ByteArray? = receipts.unsealRecovery(id)
     fun clearRecovery(id: String): Boolean = receipts.clearRecovery(id)
     fun latestRecovery(): String? = receipts.latestPending()
+    fun pendingRecoveryIds(): List<String> = receipts.pendingIds()
 
     @Synchronized
     fun openSource(index: Int) {

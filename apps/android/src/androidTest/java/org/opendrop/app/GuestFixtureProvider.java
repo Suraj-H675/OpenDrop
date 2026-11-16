@@ -30,10 +30,15 @@ public final class GuestFixtureProvider extends ContentProvider {
         if ("first".equals(last)) filename = "first.txt";
         else if ("second".equals(last)) filename = "second.txt";
         else if ("denied".equals(last)) filename = "denied.txt";
+        else if ("empty".equals(last)) filename = "empty.txt";
+        else if ("known".equals(last)) filename = "known.txt";
         else throw new IllegalArgumentException("Unknown synthetic fixture");
         MatrixCursor cursor = new MatrixCursor(
             new String[] {OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE});
-        cursor.addRow(new Object[] {filename, -1L});
+        // Both real known-size and unknown-size content:// readers matter.
+        long declared = "empty".equals(last) ? 0L :
+            "known".equals(last) ? "hosted known-length source".length() : -1L;
+        cursor.addRow(new Object[] {filename, declared});
         return cursor;
     }
 
@@ -47,6 +52,10 @@ public final class GuestFixtureProvider extends ContentProvider {
             payload = "hosted ContentResolver pipe #1";
         } else if ("second".equals(uri.getLastPathSegment())) {
             payload = "hosted ContentResolver pipe #2";
+        } else if ("empty".equals(uri.getLastPathSegment())) {
+            payload = "";
+        } else if ("known".equals(uri.getLastPathSegment())) {
+            payload = "hosted known-length source";
         } else {
             throw new FileNotFoundException("Unknown synthetic fixture");
         }

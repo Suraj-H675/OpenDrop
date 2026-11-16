@@ -1,6 +1,7 @@
 package org.opendrop.app
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.os.Bundle
 import android.widget.Button
 import android.widget.EditText
@@ -73,8 +74,8 @@ class ShareIngressActivity : Activity() {
             setOnClickListener { startTransfer(false) }
         }
         recover = Button(this).apply {
-            text = "Recover previous completion"
-            setOnClickListener { startTransfer(true) }
+            text = "Choose unresolved receipt to recover"
+            setOnClickListener { chooseRecovery() }
         }
         column.addView(send)
         column.addView(recover)
@@ -104,7 +105,29 @@ class ShareIngressActivity : Activity() {
         runCatching { GuestNative.cancel() }
     }
 
-    private fun startTransfer(recovery: Boolean) {
+    private fun chooseRecovery() {
+        if (sending || isFinishing || isDestroyed) return
+        try {
+            val entries = ProtectedReceiptStore(this).pendingIds()
+            if (entries.isEmpty()) {
+                updateStatus("No unexpired pending receipts. Never resend an uncertain file blindly.")
+                return
+            }
+            // Only the owner can choose the EXACT transfer ID. A second
+            // unresolved record is never hidden by a global latest pointer.
+            AlertDialog.Builder(this)
+                .setTitle("Recover one existing committed receipt")
+                .setItems(entries.toTypedArray()) { _, choice ->
+                    if (!isFinishing && !isDestroyed) startTransfer(true, entries[choice])
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+        } catch (_: Exception) {
+            updateStatus("Pending receipts are unavailable; no file was re-uploaded.")
+        }
+    }
+
+    private fun startTransfer(recovery: Boolean, selectedRecoveryId: String? = null) {
         if (sending) return
         val host = endpoint.text.toString().trim()
         val number = port.text.toString().toIntOrNull()
@@ -121,8 +144,9 @@ class ShareIngressActivity : Activity() {
         Thread({
             try {
                 if (recovery) {
-                    val id = localBridge.latestRecovery()
-                        ?: error("No unexpired recovery record. Do not reupload an uncertain transfer blindly.")
+                    val id = selectedRecoveryId
+                        ?.takeIf { it in localBridge.pendingRecoveryIds() }
+                        ?: error("Selected recovery is unavailable. Never blindly reupload.")
                     val result = GuestNative.recoverOne(localBridge, id, host, number)
                     updateStatus(result)
                 } else {

@@ -136,6 +136,8 @@ class GuestRuntimeInstrumentation : Instrumentation() {
         }.isFailure, "revoked URI access must fail")
 
         val recordId = "abcdef0123456789abcdef0123456789"
+        val secondId = "11111111111111111111111111111111"
+        val thirdId = "22222222222222222222222222222222"
         checkpoint = "seal-android-keystore-recovery"
         val disposable = ByteArray(32) { (it + 1).toByte() }
         val store = ProtectedReceiptStore(app)
@@ -144,6 +146,12 @@ class GuestRuntimeInstrumentation : Instrumentation() {
         requireTest(disposable.all { it == 0.toByte() }, "plaintext wipe after seal")
         requireTest(store.latestPending() == recordId &&
             store.unsealRecovery(recordId)?.size == 32, "encrypted recovery")
+        requireTest(store.sealRecovery(secondId, System.currentTimeMillis() + 600_000L,
+            ByteArray(32) { 11 }), "independent second encrypted recovery")
+        requireTest(store.sealRecovery(thirdId, System.currentTimeMillis() + 600_000L,
+            ByteArray(32) { 22 }), "independent third encrypted recovery")
+        requireTest(store.pendingIds().toSet() == setOf(recordId, secondId, thirdId),
+            "all pending transfers are independently discoverable")
         requireTest(app.getSharedPreferences("s1e_runtime", Context.MODE_PRIVATE).edit()
             .putString("id", id).putString("spki", sha(spki))
             .putInt("pid", Process.myPid()).commit(), "persist public-only restart record")
@@ -161,7 +169,11 @@ class GuestRuntimeInstrumentation : Instrumentation() {
             sha(identity.publicSpki()) == state.getString("spki", null),
             "stable AndroidKeyStore identity after restart")
         val recordId = "abcdef0123456789abcdef0123456789"
+        val secondId = "11111111111111111111111111111111"
+        val thirdId = "22222222222222222222222222222222"
         val receipts = ProtectedReceiptStore(app)
+        requireTest(receipts.pendingIds().toSet() == setOf(recordId, secondId, thirdId),
+            "multiple pending receipts survive real app process restart")
         val plaintext = receipts.unsealRecovery(recordId)
         requireTest(plaintext != null &&
             plaintext.contentEquals(ByteArray(32) { (it + 1).toByte() }),
@@ -174,8 +186,46 @@ class GuestRuntimeInstrumentation : Instrumentation() {
             "test-only corruption")
         requireTest(runCatching { receipts.unsealRecovery(recordId) }.isFailure,
             "tampered AES-GCM must fail")
-        requireTest(receipts.clearRecovery(recordId) && receipts.latestPending() == null,
-            "protected record cleanup")
+        requireTest(receipts.pendingIds().containsAll(listOf(secondId, thirdId)),
+            "one corrupt receipt cannot hide unrelated pending receipts")
+        requireTest(receipts.clearRecovery(thirdId) &&
+            receipts.pendingIds().toSet() == setOf(recordId, secondId),
+            "clearing newest does not hide earlier unresolved receipts")
+        requireTest(receipts.unsealRecovery(secondId)?.contentEquals(ByteArray(32) { 11 }) == true,
+            "older original receipt remains independently decryptable")
+        requireTest(receipts.clearRecovery(recordId),
+            "corrupt test record removed independently")
+
+        // Expiration acts on a single record and never masks others.
+        val expiring = "33333333333333333333333333333333"
+        requireTest(receipts.sealRecovery(expiring, System.currentTimeMillis() + 600_000L,
+            ByteArray(32) { 33 }), "expiring record sealed")
+        requireTest(prefs.edit().putLong("until:$expiring",
+            System.currentTimeMillis() - 1L).commit(), "simulate exact expired metadata")
+        requireTest(receipts.pendingIds() == listOf(secondId),
+            "prune one expired record without masking older valid")
+
+        // Bounded capacity prevents any unresolved credential from being
+        // silently evicted by later transfers, even over many app sessions.
+        val filler = (0 until ProtectedReceiptStore.MAX_PENDING - 1).map {
+            "%032x".format(0x1000 + it)
+        }
+        for (id in filler) requireTest(receipts.sealRecovery(id,
+            System.currentTimeMillis() + 600_000L, ByteArray(32) { 1 }),
+            "bounded pending record committed")
+        requireTest(receipts.pendingIds().size == ProtectedReceiptStore.MAX_PENDING,
+            "all 16 unresolved receipts discoverable")
+        val extra = ByteArray(32) { 99 }
+        requireTest(runCatching {
+            receipts.sealRecovery("ffffffffffffffffffffffffffffffff",
+                System.currentTimeMillis() + 600_000L, extra)
+        }.isFailure && extra.all { it == 0.toByte() },
+            "capacity exceeded fails closed and wipes supplied credential")
+        requireTest(receipts.pendingIds().size == ProtectedReceiptStore.MAX_PENDING,
+            "capacity rejection did not evict an unresolved receipt")
+        for (id in filler + secondId) requireTest(receipts.clearRecovery(id),
+            "individual receipt cleanly resolved")
+        requireTest(receipts.pendingIds().isEmpty(), "all test receipts cleaned")
         // Deliberately delete test-installed identity LAST; production code
         // must refuse to silently reprovision an established key.
         KeyStore.getInstance("AndroidKeyStore").apply { load(null) }

@@ -18,9 +18,10 @@ import android.os.Bundle;
  * data, no permission request and no counterpart in the release APK.
  */
 public final class GuestGrantIssuerProvider extends ContentProvider {
-    private static final String TARGET = "org.opendrop.app";
+    private static final String NORMAL = "org.opendrop.app";
+    private static final String OFFLINE = "org.opendrop.app.s1fsmoke";
     private static final String AUTHORITY = "org.opendrop.app.test.fixtures";
-    private static final String[] PATHS = {"first", "second", "denied"};
+    private static final String[] PATHS = {"first", "second", "denied", "empty", "known"};
 
     @Override public boolean onCreate() { return true; }
     @Override public String getType(Uri uri) { return null; }
@@ -31,7 +32,8 @@ public final class GuestGrantIssuerProvider extends ContentProvider {
     @Override public Bundle call(String method, String arg, Bundle extras) {
         // Android validates getCallingPackage() against the Binder calling
         // UID, unlike an untrusted caller-supplied name.
-        if (!TARGET.equals(getCallingPackage())) {
+        String caller = getCallingPackage();
+        if (!NORMAL.equals(caller) && !OFFLINE.equals(caller)) {
             throw new SecurityException("Not the verified instrumentation target");
         }
         if (arg != null || extras != null ||
@@ -50,7 +52,7 @@ public final class GuestGrantIssuerProvider extends ContentProvider {
                     .scheme("content").authority(AUTHORITY).appendPath(path).build();
                 if ("grant".equals(method)) {
                     context.grantUriPermission(
-                        TARGET, source, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        caller, source, Intent.FLAG_GRANT_READ_URI_PERMISSION);
                 } else {
                     context.revokeUriPermission(source, Intent.FLAG_GRANT_READ_URI_PERMISSION);
                 }

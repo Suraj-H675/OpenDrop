@@ -6,11 +6,18 @@
 //! The production Android bridge is compiled ONLY on Android, and never
 //! constructs software/private-file signing identities.
 
+#[cfg(not(feature = "offline-smoke"))]
 pub mod recovery;
+#[cfg(not(feature = "offline-smoke"))]
 pub mod sender;
 
 #[cfg(target_os = "android")]
+mod android_identity_probe;
+#[cfg(all(target_os = "android", not(feature = "offline-smoke")))]
 mod android_jni;
+
+#[cfg(all(feature = "offline-smoke", feature = "hosted-guest-fixture"))]
+compile_error!("offline Android diagnostic cannot link hosted sender fixture");
 
 #[cfg(all(feature = "hosted-guest-fixture", not(debug_assertions)))]
 compile_error!("test-only guest approval cannot be linked into release builds");

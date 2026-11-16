@@ -16,6 +16,20 @@ android {
         testInstrumentationRunner 'org.opendrop.app.GuestRuntimeInstrumentation'
     }
 
+    // The owner-installed diagnostic is a distinct package and distinct
+    // SOURCE variant. Production's sender Activity/bridge/JNI entry class
+    // reside under src/normal/, never on the offlineSmoke Java classpath.
+    flavorDimensions 'mode'
+    productFlavors {
+        normal { dimension 'mode' }
+        offlineSmoke {
+            dimension 'mode'
+            applicationIdSuffix '.s1fsmoke'
+            versionNameSuffix '-offline-smoke'
+            testInstrumentationRunner 'org.opendrop.app.OfflineSmokeInstrumentation'
+        }
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17

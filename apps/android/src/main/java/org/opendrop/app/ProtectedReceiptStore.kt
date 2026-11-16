@@ -14,6 +14,7 @@ import javax.crypto.SecretKey
  * are not secrets, but authenticated as AES-GCM associated data.
  */
 internal class ProtectedReceiptStore(context: Context) {
+    companion object { const val MAX_PENDING = 16 }
     private val prefs = context.getSharedPreferences("guest_receipts", Context.MODE_PRIVATE)
     private val alias = "opendrop.s1.recovery.aesgcm.v1"
     private val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
@@ -45,6 +46,15 @@ internal class ProtectedReceiptStore(context: Context) {
     fun sealRecovery(id: String, expiresMs: Long, plaintext: ByteArray): Boolean {
         require(validId(id) && plaintext.size in 1..1024 && expiresMs > System.currentTimeMillis())
         try {
+            pruneExpired()
+            // A single "latest" pointer was unsafe: it could strand earlier
+            // unresolved transfers when a newer credential was removed.
+            // Keep every record separately and refuse excess unresolved
+            // transfers instead of silently evicting one.
+            check(!prefs.contains("sealed:$id")) { "Existing pending receipt cannot be overwritten" }
+            check(prefs.all.keys.count { it.startsWith("sealed:") } < MAX_PENDING) {
+                "Too many unresolved receipts; recover explicitly before sending more"
+            }
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.ENCRYPT_MODE, key())
             cipher.updateAAD("$id:$expiresMs".toByteArray(Charsets.US_ASCII))
@@ -53,7 +63,6 @@ internal class ProtectedReceiptStore(context: Context) {
             return prefs.edit()
                 .putString("sealed:$id", Base64.encodeToString(wrapped, Base64.NO_WRAP))
                 .putLong("until:$id", expiresMs)
-                .putString("latest", id)
                 .commit()
         } finally {
             // JNI's temporary Java-heap copy must not retain a second live
@@ -83,16 +92,32 @@ internal class ProtectedReceiptStore(context: Context) {
     @Synchronized
     fun clearRecovery(id: String): Boolean {
         require(validId(id))
-        val edit = prefs.edit().remove("sealed:$id").remove("until:$id")
-        if (prefs.getString("latest", null) == id) edit.remove("latest")
-        return edit.commit()
+        return prefs.edit().remove("sealed:$id").remove("until:$id")
+            .remove("latest") // safely retire legacy single-ID metadata
+            .commit()
     }
 
     @Synchronized
-    fun latestPending(): String? {
+    fun pendingIds(): List<String> {
         pruneExpired()
-        return prefs.getString("latest", null)?.takeIf(::validId)
+        // Each authenticated credential has its own exact recovery ID and
+        // expiry. No global pointer/index can hide another valid record.
+        // Invalid entries are never used as keys or silently deleted.
+        val now = System.currentTimeMillis()
+        return prefs.all.keys.asSequence()
+            .filter { it.startsWith("sealed:") }
+            .map { it.removePrefix("sealed:") }
+            .filter { validId(it) && prefs.getLong("until:$it", 0L) > now }
+            .sortedWith(compareBy<String> { prefs.getLong("until:$it", Long.MAX_VALUE) }
+                .thenBy { it })
+            .take(MAX_PENDING)
+            .toList()
     }
+
+    // Retained only for backwards-compatible isolated instrumentation;
+    // the production recovery UI MUST use pendingIds() and explicit choice.
+    @Synchronized
+    fun latestPending(): String? = pendingIds().lastOrNull()
 
     @Synchronized
     fun pruneExpired() {
