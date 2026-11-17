@@ -83,14 +83,37 @@ jobs:
         run: |
           set -euo pipefail
           cargo build -p opendrop-linux-receiver --bin opendrop-linux-receiver --release --locked
+          release_binary=target/release/opendrop-linux-receiver
+          test -s "$release_binary"
+          release_sha_before="$(sha256sum "$release_binary" | cut -d' ' -f1)"
           if cargo build -p opendrop-linux-receiver --bin opendrop-linux-receiver                --release --locked --features hosted-guest-fixture > "$RUNNER_TEMP/unsafe.log" 2>&1; then
             echo 'CI-only identity/virtual-network fixture leaked into RELEASE!' >&2; exit 1
+          else
+            unsafe_exit=$?
           fi
-          grep -F 'hosted-guest-fixture is forbidden for production release builds' "$RUNNER_TEMP/unsafe.log"
+          echo "D148_UNSAFE_RELEASE_BUILD_EXIT=$unsafe_exit"
+          # Cargo compiles dependencies before the receiver binary. Any of
+          # these explicit compile_error! guards can reject the feature first.
+          # An unrelated compiler failure must not count as proof of exclusion.
+          if ! grep -F -e 'error: hosted-guest-fixture owner-action simulation is forbidden in release builds' \
+                     -e 'error: test-only guest approval cannot be linked into release builds' \
+                     -e 'error: hosted-guest-fixture is forbidden for production release builds' \
+                     "$RUNNER_TEMP/unsafe.log"; then
+            echo 'Unsafe release build failed without an expected fixture-exclusion guard:' >&2
+            cat "$RUNNER_TEMP/unsafe.log" >&2
+            exit 1
+          fi
+          test "$(sha256sum "$release_binary" | cut -d' ' -f1)" = "$release_sha_before"
+          echo "D148_NORMAL_RELEASE_BINARY_SHA256=$release_sha_before"
           echo D148_RELEASE_BUILD_WITH_HOSTED_FIXTURE=BLOCKED
           # NO hosted netns can remain: only the test runner was allowed to
           # create these disposable virtual links.
-          test -z "$(sudo ip netns list | grep od148 || true)"
+          remaining="$(sudo ip netns list | grep od148 || true)"
+          if test -n "$remaining"; then
+            echo "D148_NETNS_CLEANUP_FAILED=$remaining" >&2
+            exit 1
+          fi
+          echo D148_NETNS_CLEANUP=PASS
   windows-cng-wire-contract:
 
     runs-on: windows-2022
