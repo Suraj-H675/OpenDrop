@@ -99,6 +99,14 @@ fn display(message: &'static [u8]) {
     unsafe { opendrop_qt_foreground_status(message.as_ptr().cast()) };
 }
 
+fn display_nearby_diagnostic(message: &str) {
+    // Nearby diagnostics contain only fixed categories and capped counters,
+    // never packet bytes, owner data or untrusted strings. Qt copies text.
+    if let Ok(safe) = std::ffi::CString::new(message) {
+        unsafe { opendrop_qt_foreground_status(safe.as_ptr()) };
+    }
+}
+
 struct QtForeground;
 impl QtForeground {
     fn start() -> Result<Self, &'static str> {
@@ -342,6 +350,7 @@ enum UiEvent {
     GuestSas(GuestSasRequest),
     GuestOffer(GuestOfferRequest),
     Status(&'static [u8]),
+    NearbyDiagnostic(String),
 }
 
 pub fn run() -> Result<(), &'static str> {
@@ -547,6 +556,7 @@ pub fn run() -> Result<(), &'static str> {
         }
         match events_rx.recv_timeout(Duration::from_millis(35)) {
             Ok(UiEvent::Status(text)) => display(text),
+            Ok(UiEvent::NearbyDiagnostic(text)) => display_nearby_diagnostic(&text),
             Ok(UiEvent::Offer(request)) => {
                 owner_approval(request, &mut journal, &storage, &running);
             }
@@ -785,10 +795,14 @@ fn serve_one_automatically_discovered_guest(
             };
             let _ = ui.try_send(UiEvent::Status(message));
         }
-        Err(_) => {
-            let _ = ui.try_send(UiEvent::Status(
-                b"Local discovery or private transport unavailable; no Internet fallback.\0",
-            ));
+        Err(error) => {
+            if let Some(safe) = nearby_lan::safe_ui_diagnostic(&error) {
+                let _ = ui.try_send(UiEvent::NearbyDiagnostic(safe));
+            } else {
+                let _ = ui.try_send(UiEvent::Status(
+                    b"Local discovery or private transport unavailable; no Internet fallback.\0",
+                ));
+            }
         }
     }
 }

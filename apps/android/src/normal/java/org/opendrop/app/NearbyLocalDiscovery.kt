@@ -193,37 +193,50 @@ internal class NearbyHotspotBeacon(
     private val local: Inet4Address,
     private val prefix: Int,
     port: Int,
+    private val onDiagnostic: (NearbyDiagnostic, Int) -> Unit = { _, _ -> },
 ) : Closeable {
     private val live = AtomicBoolean(true)
     @Volatile private var socket: DatagramSocket? = null
     private val bytes = NearbyLocalWire.encode(NearbyLocalWire.senderListener, port)
+    private val sends = NearbyBoundedCount()
+
+    private fun report(code: NearbyDiagnostic) {
+        // Diagnostics must never alter the foreground transfer or packet path.
+        runCatching { onDiagnostic(code, sends.value()) }
+    }
 
     fun start() {
         val broadcast = NearbyLocalWire.directedBroadcast(local, prefix)
         Thread({
+            var bound = false
+            var opened: DatagramSocket? = null
             try {
                 val udp = DatagramSocket(null)
+                opened = udp
                 udp.broadcast = true
                 udp.bind(InetSocketAddress(local, 0))
+                bound = true
                 socket = udp
+                report(NearbyDiagnostic.HotspotBeaconBound) // Actual successful bind.
                 val started = SystemClock.elapsedRealtime()
                 while (live.get() && SystemClock.elapsedRealtime() - started < 120_000L) {
                     val advertised = DatagramPacket(
                         bytes, bytes.size, broadcast, NearbyLocalWire.discoveryPort
                     )
                     udp.send(advertised)
-                    // A foreground transfer owns this sender. A close
-                    // interrupt must stop it, no periodic background worker.
+                    // A successful send() is not proof that the peer received it.
+                    val count = sends.observed()
+                    if (count == 1 || count == 64) report(NearbyDiagnostic.HotspotBeaconSent)
                     for (tick in 0 until 20) {
                         if (!live.get()) break
                         Thread.sleep(100)
                     }
                 }
             } catch (_: Exception) {
-                // Lack of broadcast reachability is a discoverability failure,
-                // never a reason to attempt WAN/cellular fallback.
+                if (live.get()) report(classifyBeaconException(bound))
+                // No default, cellular or VPN fallback on local broadcast failure.
             } finally {
-                socket?.close()
+                runCatching { opened?.close() }
                 socket = null
                 live.set(false)
             }

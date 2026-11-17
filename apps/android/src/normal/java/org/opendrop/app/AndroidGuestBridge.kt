@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class AndroidGuestBridge(
     private val activity: Activity,
     private val shares: List<SharedFile>,
+    private val onDiagnostic: (NearbyDiagnostic, Int) -> Unit = { _, _ -> },
 ) {
     private val cancelled = AtomicBoolean(false)
     private val identity = GuestIdentity(activity)
@@ -42,6 +43,14 @@ class AndroidGuestBridge(
     @Volatile private var activeBeacon: NearbyHotspotBeacon? = null
     @Volatile private var connectingSocket: Socket? = null
     @Volatile private var sourceStream: InputStream? = null
+    @Volatile private var hotspotSelectionReached = false
+
+    fun reachedHotspotSelection(): Boolean = hotspotSelectionReached
+
+    private fun report(code: NearbyDiagnostic, count: Int = 0) {
+        // A diagnostic failure cannot authorize a route, trust or file transfer.
+        runCatching { onDiagnostic(code, count) }
+    }
 
     fun installationId(): String = identity.installationId()
     fun publicSpki(): ByteArray = identity.publicSpki()
@@ -167,8 +176,13 @@ class AndroidGuestBridge(
         // Hotspot downstream is not exposed as an Android Wi-Fi Network on
         // many OEMs. Select only a nonvirtual Wi-Fi AP interface whose
         // actual InterfaceAddress prefix contains the explicit Linux peer.
-        val interfaces = NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
-        val eligible = interfaces.filter { iface ->
+        hotspotSelectionReached = true
+        val interfaces = try { NetworkInterface.getNetworkInterfaces()?.toList().orEmpty() }
+            catch (error: Exception) {
+                report(NearbyDiagnostic.HotspotInterfaceInspectionFailed)
+                throw error
+            }
+        val eligible = try { interfaces.filter { iface ->
             val name = iface.name.orEmpty()
             (name.startsWith("wlan") || name.startsWith("ap") ||
                 name.startsWith("swlan") || name.startsWith("tether")) &&
@@ -190,17 +204,27 @@ class AndroidGuestBridge(
                     if (allowed) local to prefix else null
                 }
             }
-        }.distinct()
-        require(eligible.size == 1) {
-            "No unique, directly attached private hotspot Wi-Fi interface for this peer"
+        }.distinct() } catch (error: Exception) {
+            report(NearbyDiagnostic.HotspotInterfaceInspectionFailed)
+            throw error
+        }
+        if (eligible.size != 1) {
+            report(classifyHotspotInterfaceCount(eligible.size))
+            error("No unique, directly attached private hotspot Wi-Fi interface for this peer")
         }
         val (local, localPrefix) = eligible.single()
+        report(NearbyDiagnostic.HotspotInterfaceSelected)
         // Binding only this local address prevents an accidental WAN,
         // wildcard, cellular, USB-forwarded or VPN listener.
         val listener = ServerSocket()
         try {
             listener.reuseAddress = false
-            listener.bind(InetSocketAddress(local, port), 1)
+            try { listener.bind(InetSocketAddress(local, port), 1) }
+            catch (error: Exception) {
+                report(NearbyDiagnostic.HotspotTcpBindFailed)
+                throw error
+            }
+            report(NearbyDiagnostic.HotspotTcpBound)
             listener.soTimeout = 250
             check(!cancelled.get()) { "Foreground session cancelled" }
             synchronized(this) {
@@ -210,7 +234,12 @@ class AndroidGuestBridge(
             // Broadcast only via this bound local AP address. No cellular,
             // VPN, generic default Network or all-interface listener.
             if (automaticPeer) {
-                val beacon = NearbyHotspotBeacon(local, localPrefix, port)
+                val beacon = NearbyHotspotBeacon(local, localPrefix, port) { code, count ->
+                    report(code, count)
+                    // A failed discovery sender must not silently leave an
+                    // apparently healthy TCP wait running to its deadline.
+                    if (code.terminalFailure) runCatching { listener.close() }
+                }
                 synchronized(this) {
                     check(!cancelled.get())
                     activeBeacon = beacon
@@ -224,31 +253,41 @@ class AndroidGuestBridge(
                 catch (_: SocketTimeoutException) { continue }
                 break
             }
-            val incoming = accepted ?: error("Owner foreground hotspot listener timed out/cancelled")
+            if (accepted == null) {
+                report(if (cancelled.get()) NearbyDiagnostic.HotspotCancelled
+                    else NearbyDiagnostic.HotspotWaitExpired)
+                error("Owner foreground hotspot listener timed out/cancelled")
+            }
+            val incomingSocket = accepted
             try {
-                val actualPeer = incoming.inetAddress as? java.net.Inet4Address
-                check(!cancelled.get() && incoming.localAddress == local &&
-                    actualPeer != null &&
-                    (if (peer == null) NearbyLocalWire.sameLink(local, actualPeer, localPrefix)
-                     else actualPeer == peer)) {
-                    "Unexpected source or destination; guest rejected before TLS"
+                val actualPeer = incomingSocket.inetAddress as? java.net.Inet4Address
+                if (cancelled.get() || incomingSocket.localAddress != local ||
+                    actualPeer == null ||
+                    !(if (peer == null) NearbyLocalWire.sameLink(local, actualPeer, localPrefix)
+                      else actualPeer == peer)) {
+                    report(NearbyDiagnostic.HotspotPeerRejected)
+                    error("Unexpected source or destination; guest rejected before TLS")
                 }
                 // The AP may disappear while the owner inspects their phone.
                 val stillLocal = NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
                     .any { it.isUp && !it.isLoopback &&
                         it.interfaceAddresses.any { address -> address.address == local } }
-                check(stillLocal) { "Hotspot-local interface disappeared" }
-                incoming.soTimeout = 250
-                val parcel = ParcelFileDescriptor.fromSocket(incoming)
+                if (!stillLocal) {
+                    report(NearbyDiagnostic.HotspotPeerRejected)
+                    error("Hotspot-local interface disappeared")
+                }
+                report(NearbyDiagnostic.HotspotTcpAccepted)
+                incomingSocket.soTimeout = 250
+                val parcel = ParcelFileDescriptor.fromSocket(incomingSocket)
                 val descriptor = parcel.dup().detachFd()
                 synchronized(this) {
                     check(!cancelled.get())
-                    activeSocket = incoming
+                    activeSocket = incomingSocket
                     activeParcel = parcel
                 }
                 return descriptor
             } catch (error: Exception) {
-                incoming.close()
+                incomingSocket.close()
                 throw error
             }
         } finally {
@@ -312,6 +351,9 @@ class AndroidGuestBridge(
     }
 
     fun cancel() {
+        if (hotspotSelectionReached && activeListener != null && !cancelled.get()) {
+            report(NearbyDiagnostic.HotspotCancelled)
+        }
         cancelled.set(true)
         // Close the blocking acceptor BEFORE waiting on the monitor. A
         // stalled connect/source reader cannot delay cancellation of it.

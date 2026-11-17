@@ -115,6 +115,42 @@ class GuestRuntimeInstrumentation : Instrumentation() {
         ) == null, "truncated discovery rejected")
         requireTest(NearbyLocalWire.directedBroadcast(client, 24).hostAddress == "10.34.80.255",
             "correct private directed broadcast and no default route")
+        checkpoint = "d150-safe-hotspot-stage-and-terminal-status-diagnostics"
+        requireTest(classifyHotspotInterfaceCount(0) == NearbyDiagnostic.HotspotInterfaceMissing,
+            "missing AP route is explicit")
+        requireTest(classifyHotspotInterfaceCount(1) == NearbyDiagnostic.HotspotInterfaceSelected,
+            "exactly one AP route is selectable")
+        requireTest(classifyHotspotInterfaceCount(2) == NearbyDiagnostic.HotspotInterfaceAmbiguous,
+            "multiple AP routes rejected")
+        requireTest(classifyBeaconException(false) == NearbyDiagnostic.HotspotBeaconBindFailed &&
+            classifyBeaconException(true) == NearbyDiagnostic.HotspotBeaconSendFailed,
+            "beacon bind and send failures separate")
+        val statusPolicy = NearbyStatusPolicy()
+        requireTest(statusPolicy.accept(NearbyDiagnostic.HotspotTcpBound.label),
+            "successful listener status accepted")
+        requireTest(statusPolicy.accept(NearbyDiagnostic.HotspotBeaconBound.label),
+            "successful beacon bind status accepted")
+        requireTest(statusPolicy.accept(NearbyDiagnostic.HotspotBeaconSendFailed.label, true),
+            "actual terminal beacon failure pinned")
+        requireTest(!statusPolicy.accept("No unique permitted local Wi-Fi/Ethernet path"),
+            "ordinary discovery cannot overwrite hotspot terminal result")
+        requireTest(statusPolicy.current() == NearbyDiagnostic.HotspotBeaconSendFailed.label &&
+            statusPolicy.isFinal(), "terminal failure retained")
+        statusPolicy.resetForOwnerAttempt()
+        requireTest(!statusPolicy.isFinal() &&
+            statusPolicy.accept(NearbyDiagnostic.PreNetworkFailed.label, true),
+            "only a new explicit owner attempt resets terminal state")
+        requireTest(!statusPolicy.accept(NearbyDiagnostic.HotspotTcpBound.label),
+            "stale callbacks cannot overwrite source pre-network terminal failure")
+        val bounded = NearbyBoundedCount(3)
+        repeat(100) { bounded.observed() }
+        requireTest(bounded.value() == 3, "bounded non-sensitive stage counters")
+        requireTest(NearbyDiagnostic.values().all { diagnostic ->
+            !diagnostic.label.contains("10.34") &&
+                !diagnostic.label.contains("sha256") &&
+                !diagnostic.label.contains("file://")
+        }, "no network endpoint, credential or personal file in diagnostics")
+
         checkpoint = "invoke-production-jni-and-rust-keystore-proof"
         val owner = AndroidGuestBridge(activity, emptyList())
         requireTest(GuestNative.identitySelfTest(owner) == sha(spki),

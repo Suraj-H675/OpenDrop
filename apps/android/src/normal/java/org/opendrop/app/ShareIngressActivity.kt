@@ -30,6 +30,7 @@ class ShareIngressActivity : Activity() {
     )
     private val nearby = linkedMapOf<String, SeenCandidate>()
     private var sources: List<SharedFile> = emptyList()
+    private val nearbyStatus = NearbyStatusPolicy()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -75,7 +76,7 @@ class ShareIngressActivity : Activity() {
             text = "Cancel and close connection"
             setOnClickListener {
                 cancelTransfer()
-                updateStatus("Cancelled; no automatic re-upload. Use recovery after uncertain completion.")
+                updateStatus("Cancelled; no automatic re-upload. Use recovery after uncertain completion.", terminal = true)
             }
         })
         status = TextView(this).apply {
@@ -86,9 +87,11 @@ class ShareIngressActivity : Activity() {
         setContentView(ScrollView(this).apply { addView(column) })
     }
 
-    private fun updateStatus(message: String) {
+    private fun updateStatus(message: String, terminal: Boolean = false) {
+        if (!nearbyStatus.accept(message, terminal)) return
         runOnUiThread {
-            if (!isDestroyed) status.text = message
+            // Read the current monotonic policy, not a queued stale message.
+            if (!isDestroyed) status.text = nearbyStatus.current()
         }
     }
 
@@ -204,7 +207,13 @@ class ShareIngressActivity : Activity() {
         }
         discovery?.close()
         discovery = null
-        val localBridge = AndroidGuestBridge(this, sources)
+        nearbyStatus.resetForOwnerAttempt()
+        val localBridge = AndroidGuestBridge(this, sources) { code, count ->
+            val message = if (code == NearbyDiagnostic.HotspotBeaconSent)
+                "${code.label} (bounded count: $count)"
+            else code.label
+            updateStatus(message, terminal = code.terminalFailure)
+        }
         bridge = localBridge
         sending = true
         send.isEnabled = false
@@ -219,21 +228,29 @@ class ShareIngressActivity : Activity() {
                     val result = if (reverseTcp)
                             GuestNative.recoverHotspot(localBridge, id, host, number)
                     else GuestNative.recoverOne(localBridge, id, host, number)
-                    updateStatus(result)
+                    updateStatus(result, terminal = true)
                 } else {
                     for ((index, source) in sources.withIndex()) {
-                        updateStatus("Sending ${index + 1}/${sources.size}: ${source.name}. Verify the same code on the receiver.")
+                        updateStatus("Preparing granted source ${index + 1}/${sources.size}; hotspot socket not yet selected.")
                         val result = if (reverseTcp)
                             GuestNative.sendHotspot(localBridge, index, source.name,
                                 source.declaredSize ?: -1L, host, number)
                         else GuestNative.sendOne(
                             localBridge, index, source.name, source.declaredSize ?: -1L, host, number)
-                        updateStatus(result)
+                        if (reverseTcp && !result.startsWith("OK:") &&
+                            !localBridge.reachedHotspotSelection()) {
+                            updateStatus(NearbyDiagnostic.PreNetworkFailed.label, terminal = true)
+                        } else {
+                            updateStatus(result, terminal =
+                                !result.startsWith("OK:") || index == sources.lastIndex)
+                        }
                         if (!result.startsWith("OK:")) break
                     }
                 }
             } catch (_: Exception) {
-                updateStatus("Transfer unavailable or interrupted. No success claimed; check pending recovery.")
+                if (reverseTcp && !localBridge.reachedHotspotSelection())
+                    updateStatus(NearbyDiagnostic.PreNetworkFailed.label, terminal = true)
+                else updateStatus("Transfer unavailable or interrupted; no success claimed.", terminal = true)
             } catch (_: UnsatisfiedLinkError) {
                 updateStatus("Native Rust guest engine is missing. This build cannot send.")
             } finally {
@@ -271,6 +288,7 @@ class ShareIngressActivity : Activity() {
         // sensitive SAS dialog alive. The encrypted token, if already
         // persisted after GuestReady, survives for manual receipt recovery.
         foreground = false
+        if (sending) updateStatus(NearbyDiagnostic.ForegroundStopped.label, terminal = true)
         cancelTransfer()
         discovery?.close()
         discovery = null
