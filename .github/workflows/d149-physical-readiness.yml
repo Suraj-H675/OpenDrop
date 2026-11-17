@@ -19,6 +19,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+          # Ancestor verification needs the accepted D-148 parent history.
+          fetch-depth: 0
       - name: Exact source and private exclusion
         shell: bash
         run: |
@@ -170,6 +172,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Exact source and private exclusion
         shell: bash
         run: |
