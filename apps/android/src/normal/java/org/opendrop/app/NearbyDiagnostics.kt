@@ -4,7 +4,7 @@ package org.opendrop.app
  * identity material, filenames, peer-controlled strings or exception text.
  * A state is emitted only after the corresponding operation completes/fails.
  */
-internal enum class NearbyDiagnostic(val label: String, val terminalFailure: Boolean = false) {
+enum class NearbyDiagnostic(val label: String, val terminalFailure: Boolean = false) {
     HotspotInterfaceSelected("Hotspot interface selected; checking local listener"),
     HotspotInterfaceMissing("Hotspot unavailable: no permitted local AP interface", true),
     HotspotInterfaceAmbiguous("Hotspot unavailable: multiple permitted AP interfaces", true),

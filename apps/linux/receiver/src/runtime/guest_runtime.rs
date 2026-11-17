@@ -966,7 +966,9 @@ mod hosted_socket_tests {
                         .unwrap();
                         let _ = request.result.send(Some(result));
                     }
-                    Ok(UiEvent::Status(_)) | Ok(UiEvent::Offer(_)) => {
+                    Ok(UiEvent::Status(_))
+                    | Ok(UiEvent::NearbyDiagnostic(_))
+                    | Ok(UiEvent::Offer(_)) => {
                         panic!("hosted guest must not enter the paired consent path");
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1204,7 +1206,7 @@ mod hosted_socket_tests {
                             .unwrap();
                         request.result.send(Some(approved)).unwrap();
                     }
-                    Ok(UiEvent::Status(_)) => {}
+                    Ok(UiEvent::Status(_)) | Ok(UiEvent::NearbyDiagnostic(_)) => {}
                     Ok(UiEvent::Offer(_)) => panic!("guest entered the paired owner flow"),
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1386,7 +1388,9 @@ mod hosted_socket_tests {
                         .unwrap();
                         let _ = request.result.send(Some(result));
                     }
-                    Ok(UiEvent::Status(_)) | Ok(UiEvent::Offer(_)) => {
+                    Ok(UiEvent::Status(_))
+                    | Ok(UiEvent::NearbyDiagnostic(_))
+                    | Ok(UiEvent::Offer(_)) => {
                         panic!("guest rejection must never enter paired owner UI");
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}

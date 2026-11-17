@@ -158,7 +158,7 @@ fn receiver_run() {
                     request.result.send(Some(approved)).unwrap();
                 }
             }
-            Ok(UiEvent::Status(_)) | Ok(UiEvent::Offer(_)) => {
+            Ok(UiEvent::Status(_)) | Ok(UiEvent::NearbyDiagnostic(_)) | Ok(UiEvent::Offer(_)) => {
                 panic!("guest fixture entered forbidden paired-mode owner UI");
             }
             Err(RecvTimeoutError::Timeout) => {
