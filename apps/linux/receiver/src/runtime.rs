@@ -19,7 +19,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc::{self, SyncSender, TryRecvError},
+    mpsc::{self, Receiver, SyncSender, TryRecvError},
     Arc, Mutex,
 };
 use std::thread;
@@ -31,6 +31,7 @@ const CONSENT_LIMIT: Duration = Duration::from_secs(125);
 const STREAM_LIMIT: Duration = Duration::from_secs(600);
 const FRAME_LIMIT: Duration = Duration::from_secs(8);
 const IO_TICK: Duration = Duration::from_millis(250);
+const UI_EVENT_POLL: Duration = Duration::from_millis(35);
 const MAX_TRANSFER_FRAMES: usize = 131_072;
 
 type TlsTransport = StreamOwned<ServerConnection, TcpStream>;
@@ -353,6 +354,54 @@ enum UiEvent {
     NearbyDiagnostic(String),
 }
 
+enum ForegroundEventPoll {
+    Event(UiEvent),
+    Timeout,
+    WorkerFinished,
+    OwnerStopped,
+}
+
+impl ForegroundEventPoll {
+    fn closes_foreground(&self) -> bool {
+        matches!(self, Self::OwnerStopped)
+    }
+}
+
+struct WorkerEventReceiver {
+    receiver: Option<Receiver<UiEvent>>,
+}
+
+impl WorkerEventReceiver {
+    fn new(receiver: Receiver<UiEvent>) -> Self {
+        Self {
+            receiver: Some(receiver),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.receiver.is_none()
+    }
+
+    fn poll(&mut self, owner_stop_requested: bool, running: &AtomicBool) -> ForegroundEventPoll {
+        if owner_stop_requested {
+            running.store(false, Ordering::Release);
+            return ForegroundEventPoll::OwnerStopped;
+        }
+        let Some(receiver) = self.receiver.as_ref() else {
+            return ForegroundEventPoll::WorkerFinished;
+        };
+        match receiver.recv_timeout(UI_EVENT_POLL) {
+            Ok(event) => ForegroundEventPoll::Event(event),
+            Err(mpsc::RecvTimeoutError::Timeout) => ForegroundEventPoll::Timeout,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.receiver.take();
+                running.store(false, Ordering::Release);
+                ForegroundEventPoll::WorkerFinished
+            }
+        }
+    }
+}
+
 pub fn run() -> Result<(), &'static str> {
     let args = std::env::args_os()
         .skip(1)
@@ -528,48 +577,74 @@ pub fn run() -> Result<(), &'static str> {
             _ => {}
         },
     );
+    let mut worker_events = WorkerEventReceiver::new(events_rx);
     let mut was_guest_visible = false;
-    while foreground.poll() {
-        if let Some(guest) = guest.as_ref() {
-            let mut admission = guest
-                .admission
-                .lock()
-                .map_err(|_| "Guest admission policy unavailable.")?;
-            match admission.poll_linux_qt_owner_action() {
-                Ok(LinuxGuestVisibilityAction::Revoked) | Err(_) => {
-                    admission.revoke_from_owner();
-                    if let Ok(slot) = guest.live.lock() {
-                        if let Some(active) = slot.as_ref() {
-                            active.store(false, Ordering::Release);
+    let mut terminal_nearby_result_visible = false;
+    loop {
+        let owner_stop_requested = !foreground.poll();
+        if worker_events.is_finished() && !owner_stop_requested {
+            thread::sleep(UI_EVENT_POLL);
+            continue;
+        }
+        if !owner_stop_requested && !terminal_nearby_result_visible {
+            if let Some(guest) = guest.as_ref() {
+                let mut admission = guest
+                    .admission
+                    .lock()
+                    .map_err(|_| "Guest admission policy unavailable.")?;
+                match admission.poll_linux_qt_owner_action() {
+                    Ok(LinuxGuestVisibilityAction::Revoked) | Err(_) => {
+                        admission.revoke_from_owner();
+                        if let Ok(slot) = guest.live.lock() {
+                            if let Some(active) = slot.as_ref() {
+                                active.store(false, Ordering::Release);
+                            }
                         }
                     }
+                    Ok(LinuxGuestVisibilityAction::None | LinuxGuestVisibilityAction::Opened) => {}
                 }
-                Ok(LinuxGuestVisibilityAction::None | LinuxGuestVisibilityAction::Opened) => {}
+                let visible = !admission.remaining_visibility().is_zero();
+                if visible && !was_guest_visible {
+                    display(
+                        b"Guest requests visible for ten minutes. Every file needs approval.\0",
+                    );
+                } else if !visible && was_guest_visible {
+                    display(b"Guest visibility ended. New guest requests are blocked.\0");
+                }
+                was_guest_visible = visible;
             }
-            let visible = !admission.remaining_visibility().is_zero();
-            if visible && !was_guest_visible {
-                display(b"Guest requests visible for ten minutes. Every file needs approval.\0");
-            } else if !visible && was_guest_visible {
-                display(b"Guest visibility ended. New guest requests are blocked.\0");
-            }
-            was_guest_visible = visible;
         }
-        match events_rx.recv_timeout(Duration::from_millis(35)) {
-            Ok(UiEvent::Status(text)) => display(text),
-            Ok(UiEvent::NearbyDiagnostic(text)) => display_nearby_diagnostic(&text),
-            Ok(UiEvent::Offer(request)) => {
+        let event = worker_events.poll(owner_stop_requested, &running);
+        if event.closes_foreground() {
+            break;
+        }
+        match event {
+            ForegroundEventPoll::Event(UiEvent::Status(text)) => display(text),
+            ForegroundEventPoll::Event(UiEvent::NearbyDiagnostic(text)) => {
+                terminal_nearby_result_visible = true;
+                display_nearby_diagnostic(&text);
+            }
+            ForegroundEventPoll::Event(UiEvent::Offer(request)) => {
                 owner_approval(request, &mut journal, &storage, &running);
             }
-            Ok(UiEvent::GuestSas(request)) => {
+            ForegroundEventPoll::Event(UiEvent::GuestSas(request)) => {
                 let _ = request
                     .result
                     .send(request.provisional.request_linux_qt_sas().ok());
             }
-            Ok(UiEvent::GuestOffer(request)) => {
+            ForegroundEventPoll::Event(UiEvent::GuestOffer(request)) => {
                 guest_owner_approval(request, &mut journal, &storage);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            ForegroundEventPoll::Timeout => {}
+            ForegroundEventPoll::WorkerFinished => {
+                if let Some(guest) = guest.as_ref() {
+                    if let Ok(mut admission) = guest.admission.lock() {
+                        admission.revoke_from_owner();
+                    }
+                }
+                foreground.guest_available(false);
+            }
+            ForegroundEventPoll::OwnerStopped => {}
         }
     }
     running.store(false, Ordering::Release);
@@ -578,6 +653,9 @@ pub fn run() -> Result<(), &'static str> {
             admission.revoke_from_owner();
         }
     }
+    // A worker delivering its last status through the bounded channel must
+    // never deadlock shutdown when the owner deliberately closes this UI.
+    drop(worker_events);
     worker
         .join()
         .map_err(|_| "Receiver worker stopped unexpectedly.")?;
@@ -788,19 +866,22 @@ fn serve_one_automatically_discovered_guest(
                 &ui,
                 &running,
             );
-            let message: &'static [u8] = if outcome.is_ok() {
-                b"Nearby guest session ended. Never infer success without authenticated Complete.\0"
+            let message = if outcome.is_ok() {
+                "Nearby guest session ended. Never infer success without authenticated Complete."
             } else {
-                b"Nearby connection/transfer failed closed; no automatic file retry.\0"
+                "Nearby connection/transfer failed closed; no automatic file retry."
             };
-            let _ = ui.try_send(UiEvent::Status(message));
+            // This is terminal even if a visibility timer changes on the next
+            // GUI tick. Preserve it until the owner deliberately closes.
+            let _ = ui.send(UiEvent::NearbyDiagnostic(message.to_owned()));
         }
         Err(error) => {
             if let Some(safe) = nearby_lan::safe_ui_diagnostic(&error) {
-                let _ = ui.try_send(UiEvent::NearbyDiagnostic(safe));
+                let _ = ui.send(UiEvent::NearbyDiagnostic(safe));
             } else {
-                let _ = ui.try_send(UiEvent::Status(
-                    b"Local discovery or private transport unavailable; no Internet fallback.\0",
+                let _ = ui.send(UiEvent::NearbyDiagnostic(
+                    "Local discovery or private transport unavailable; no Internet fallback."
+                        .to_owned(),
                 ));
             }
         }
@@ -1137,5 +1218,82 @@ mod tests {
             session_active: None,
         };
         assert_eq!(paired_reader.read(&mut output).unwrap(), 1);
+    }
+
+    #[test]
+    fn full_ui_queue_still_delivers_terminal_discovery_status() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(UiEvent::Status(b"Initial nearby status.\0"))
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            sender.send(UiEvent::NearbyDiagnostic(
+                "Nearby: no UDP advertisements observed (UDP seen 0, rejected 0, wrong role 0, candidates 0, TCP attempts 0).".to_owned()
+            )).unwrap();
+        });
+        let running = AtomicBool::new(true);
+        let mut events = WorkerEventReceiver::new(receiver);
+        assert!(matches!(
+            events.poll(false, &running),
+            ForegroundEventPoll::Event(UiEvent::Status(_))
+        ));
+        let mut delivered = false;
+        for _ in 0..10 {
+            match events.poll(false, &running) {
+                ForegroundEventPoll::Event(UiEvent::NearbyDiagnostic(msg)) => {
+                    assert!(msg.contains("UDP seen 0"));
+                    delivered = true;
+                    break;
+                }
+                ForegroundEventPoll::Timeout => continue,
+                _ => panic!("unexpected event while waiting for terminal discovery status"),
+            }
+        }
+        assert!(delivered, "terminal status must survive a full UI queue");
+        worker.join().unwrap();
+        assert!(matches!(
+            events.poll(false, &running),
+            ForegroundEventPoll::WorkerFinished
+        ));
+        assert!(!running.load(Ordering::Acquire));
+        assert!(!events.poll(false, &running).closes_foreground());
+    }
+
+    #[test]
+    fn worker_disconnect_preserves_final_diagnostic_and_finishes_once() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let diagnostic =
+            "Nearby: timeout (UDP seen 3, rejected 1, wrong role 1, candidates 1, TCP attempts 1).";
+        sender
+            .send(UiEvent::NearbyDiagnostic(diagnostic.to_owned()))
+            .unwrap();
+        drop(sender);
+
+        let running = AtomicBool::new(true);
+        let mut events = WorkerEventReceiver::new(receiver);
+        match events.poll(false, &running) {
+            ForegroundEventPoll::Event(UiEvent::NearbyDiagnostic(message)) => {
+                assert_eq!(message, diagnostic);
+            }
+            _ => panic!("the queued final diagnostic must be read before disconnection"),
+        }
+        assert!(running.load(Ordering::Acquire));
+        assert!(!events.is_finished());
+
+        let finished = events.poll(false, &running);
+        assert!(!finished.closes_foreground());
+        assert!(matches!(finished, ForegroundEventPoll::WorkerFinished));
+        assert!(!running.load(Ordering::Acquire));
+        assert!(events.is_finished());
+        let still_finished = events.poll(false, &running);
+        assert!(!still_finished.closes_foreground());
+        assert!(matches!(
+            still_finished,
+            ForegroundEventPoll::WorkerFinished
+        ));
+        let owner_stop = events.poll(true, &running);
+        assert!(owner_stop.closes_foreground());
+        assert!(matches!(owner_stop, ForegroundEventPoll::OwnerStopped));
+        assert!(!running.load(Ordering::Acquire));
     }
 }

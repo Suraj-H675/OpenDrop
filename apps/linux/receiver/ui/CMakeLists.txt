@@ -38,3 +38,13 @@ if(OPENDROP_BUILD_QT_TESTS)
     set_tests_properties(foreground_window_shutdown PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()
+
+option(OPENDROP_BUILD_OWNER_SESSION_INTEGRATION_TEST
+    "Build the manual active-logind-session Qt integration test" OFF)
+if(OPENDROP_BUILD_OWNER_SESSION_INTEGRATION_TEST)
+    add_executable(opendrop-qt-owner-session-integration-test
+        QtOwnerSessionIntegrationTest.cpp)
+    target_compile_features(opendrop-qt-owner-session-integration-test PRIVATE cxx_std_17)
+    target_link_libraries(opendrop-qt-owner-session-integration-test PRIVATE
+        opendrop-linux-owner-prompt Qt6::Widgets)
+endif()

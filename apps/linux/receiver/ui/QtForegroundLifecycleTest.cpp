@@ -1,4 +1,6 @@
 #include <QApplication>
+#include <QByteArray>
+#include <QLabel>
 #include <QPushButton>
 #include <QTest>
 #include <QWidget>
@@ -42,17 +44,53 @@ int main() {
         opendrop_qt_foreground_shutdown();
         return 4;
     }
-    QTest::mouseClick(enableGuests, Qt::LeftButton);
-    // A headless CI session has no authenticated owner seat. A synthetic
-    // click cannot pass the native seat check.
-    if (opendrop_qt_take_guest_visibility_action() != -1) {
+    QLabel *guestExplanation = nullptr;
+    for (QWidget *widget : QApplication::topLevelWidgets()) {
+        guestExplanation = widget->findChild<QLabel *>(
+            QStringLiteral("guestVisibilityExplanation"));
+        if (guestExplanation) {
+            break;
+        }
+    }
+    if (!guestExplanation) {
         opendrop_qt_foreground_shutdown();
         return 5;
     }
-    opendrop_qt_guest_visibility_available(1);
-    if (!enableGuests->isEnabled() || !revokeGuests->isEnabled()) {
+    QLabel *statusLabel = nullptr;
+    for (QWidget *widget : QApplication::topLevelWidgets()) {
+        statusLabel = widget->findChild<QLabel *>(QStringLiteral("foregroundStatus"));
+        if (statusLabel) {
+            break;
+        }
+    }
+    if (!statusLabel) {
         opendrop_qt_foreground_shutdown();
         return 6;
+    }
+    opendrop_qt_guest_visibility_available(0);
+    if (enableGuests->isEnabled() || revokeGuests->isEnabled() ||
+        opendrop_qt_take_guest_visibility_action() == 1) {
+        opendrop_qt_foreground_shutdown();
+        return 7;
+    }
+    opendrop_qt_guest_visibility_available(1);
+    // QT_QPA_PLATFORM=offscreen must fail closed even if the hosted runner
+    // happens to belong to an otherwise valid logind owner session.
+    if (opendrop_qt_take_guest_visibility_action() != -1 ||
+        enableGuests->isEnabled() || revokeGuests->isEnabled() ||
+        !guestExplanation->isVisible() || guestExplanation->text().trimmed().isEmpty()) {
+        opendrop_qt_foreground_shutdown();
+        return 8;
+    }
+    const QString finalResult = QStringLiteral(
+        "Nearby: timeout (UDP seen 3, rejected 1, wrong role 1, candidates 1, TCP attempts 1).");
+    const QByteArray finalResultUtf8 = finalResult.toUtf8();
+    opendrop_qt_foreground_status(finalResultUtf8.constData());
+    opendrop_qt_foreground_poll();
+    if (statusLabel->text() != finalResult ||
+        opendrop_qt_foreground_stop_requested() != 0) {
+        opendrop_qt_foreground_shutdown();
+        return 10;
     }
     bool clicked = false;
     for (QWidget *widget : QApplication::topLevelWidgets()) {
@@ -70,5 +108,5 @@ int main() {
     opendrop_qt_foreground_poll();
     const bool stopped = clicked && opendrop_qt_foreground_stop_requested() == 1;
     opendrop_qt_foreground_shutdown();
-    return stopped ? 0 : 3;
+    return stopped ? 0 : 11;
 }

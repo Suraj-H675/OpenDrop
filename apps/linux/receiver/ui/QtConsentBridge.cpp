@@ -32,6 +32,7 @@ namespace {
 std::unique_ptr<QApplication> foregroundApp;
 std::unique_ptr<QWidget> foregroundWindow;
 QLabel *foregroundStatus = nullptr;
+QLabel *guestVisibilityExplanation = nullptr;
 std::atomic<bool> foregroundStop{false};
 std::atomic<int> pendingGuestVisibilityAction{0};
 QPushButton *guestVisibilityButton = nullptr;
@@ -40,6 +41,89 @@ volatile std::sig_atomic_t caughtShutdownSignal = 0;
 
 void foreground_signal(int) {
     caughtShutdownSignal = 1;
+}
+
+// This is a sanity check on the owner desktop process, NOT cryptographic
+// proof of physical presence. A same-UID malicious process can compromise
+// the trusted app process by other means; no network peer can reach this
+// function through the existing OpenDrop protocol or public IPC.
+struct OwnerSession {
+    std::string name;
+    std::string seat;
+    uid_t uid;
+};
+
+std::optional<OwnerSession> currentOwnerSession() {
+    char *sessionName = nullptr;
+    if (sd_pid_get_session(0, &sessionName) < 0 || !sessionName) {
+        std::free(sessionName);
+        return std::nullopt;
+    }
+    const std::string name(sessionName);
+    std::free(sessionName);
+
+    if (sd_session_is_active(name.c_str()) != 1) {
+        return std::nullopt;
+    }
+    uid_t uid = 0;
+    if (sd_session_get_uid(name.c_str(), &uid) < 0 || uid != geteuid()) {
+        return std::nullopt;
+    }
+    char *sessionType = nullptr;
+    if (sd_session_get_type(name.c_str(), &sessionType) < 0 || !sessionType) {
+        return std::nullopt;
+    }
+    const std::string type(sessionType);
+    std::free(sessionType);
+    if (type != "wayland" && type != "x11") {
+        return std::nullopt;
+    }
+    char *seat = nullptr;
+    if (sd_session_get_seat(name.c_str(), &seat) < 0 || !seat) {
+        return std::nullopt;
+    }
+    const std::string ownerSeat(seat);
+    std::free(seat);
+    if (ownerSeat.empty()) {
+        return std::nullopt;
+    }
+    return OwnerSession{name, ownerSeat, uid};
+}
+
+// A real local logind session alone is not sufficient: an offscreen/test
+// platform must never enable the guest admission widget.
+bool supportedOwnerDisplay() {
+    const auto platform = QGuiApplication::platformName();
+    return platform == QStringLiteral("wayland") || platform == QStringLiteral("xcb");
+}
+
+void updateGuestVisibilityControls(bool available) {
+    auto *app = qobject_cast<QApplication *>(QCoreApplication::instance());
+    if (!app || QThread::currentThread() != app->thread()) {
+        return;
+    }
+    const bool ownerSessionAvailable =
+        supportedOwnerDisplay() && currentOwnerSession().has_value();
+    const bool enabled = available && ownerSessionAvailable;
+    if (guestVisibilityButton) {
+        guestVisibilityButton->setEnabled(enabled);
+    }
+    if (guestVisibilityOffButton) {
+        guestVisibilityOffButton->setEnabled(enabled);
+    }
+    if (guestVisibilityExplanation) {
+        if (available && !ownerSessionAvailable) {
+            guestVisibilityExplanation->setText(QStringLiteral(
+                "Guest requests require this user's active local Wayland or X11 desktop session."));
+            guestVisibilityExplanation->show();
+        } else {
+            guestVisibilityExplanation->clear();
+            guestVisibilityExplanation->hide();
+        }
+    }
+    if (!available) {
+        pendingGuestVisibilityAction.store(0, std::memory_order_release);
+    }
 }
 
 } // namespace
@@ -67,6 +151,7 @@ extern "C" int opendrop_qt_foreground_start() noexcept {
         auto *layout = new QVBoxLayout(foregroundWindow.get());
         foregroundStatus = new QLabel(
             QStringLiteral("Waiting for a previously paired device."), foregroundWindow.get());
+        foregroundStatus->setObjectName(QStringLiteral("foregroundStatus"));
         foregroundStatus->setTextFormat(Qt::PlainText);
         foregroundStatus->setWordWrap(true);
         layout->addWidget(foregroundStatus);
@@ -84,6 +169,12 @@ extern "C" int opendrop_qt_foreground_start() noexcept {
             QStringLiteral("Stop guest requests"), foregroundWindow.get());
         guestVisibilityOffButton->setEnabled(false);
         layout->addWidget(guestVisibilityOffButton);
+        guestVisibilityExplanation = new QLabel(foregroundWindow.get());
+        guestVisibilityExplanation->setObjectName(QStringLiteral("guestVisibilityExplanation"));
+        guestVisibilityExplanation->setTextFormat(Qt::PlainText);
+        guestVisibilityExplanation->setWordWrap(true);
+        guestVisibilityExplanation->hide();
+        layout->addWidget(guestVisibilityExplanation);
         QObject::connect(guestVisibilityOffButton, &QPushButton::clicked,
                          foregroundWindow.get(), []() {
             pendingGuestVisibilityAction.store(2, std::memory_order_release);
@@ -135,61 +226,11 @@ extern "C" void opendrop_qt_foreground_shutdown() noexcept {
     foregroundStatus = nullptr;
     guestVisibilityButton = nullptr;
     guestVisibilityOffButton = nullptr;
+    guestVisibilityExplanation = nullptr;
     pendingGuestVisibilityAction.store(0, std::memory_order_release);
     foregroundWindow.reset();
     foregroundApp.reset();
 }
-
-namespace {
-
-// This is a sanity check on the owner desktop process, NOT cryptographic
-// proof of physical presence. A same-UID malicious process can compromise
-// the trusted app process by other means; no network peer can reach this
-// function through the existing OpenDrop protocol or public IPC.
-struct OwnerSession {
-    std::string name;
-    std::string seat;
-    uid_t uid;
-};
-
-std::optional<OwnerSession> currentOwnerSession() {
-    char *sessionName = nullptr;
-    if (sd_pid_get_session(0, &sessionName) < 0 || !sessionName) {
-        std::free(sessionName);
-        return std::nullopt;
-    }
-    const std::string name(sessionName);
-    std::free(sessionName);
-
-    if (sd_session_is_active(name.c_str()) != 1) {
-        return std::nullopt;
-    }
-    uid_t uid = 0;
-    if (sd_session_get_uid(name.c_str(), &uid) < 0 || uid != geteuid()) {
-        return std::nullopt;
-    }
-    char *sessionType = nullptr;
-    if (sd_session_get_type(name.c_str(), &sessionType) < 0 || !sessionType) {
-        return std::nullopt;
-    }
-    const std::string type(sessionType);
-    std::free(sessionType);
-    if (type != "wayland" && type != "x11") {
-        return std::nullopt;
-    }
-    char *seat = nullptr;
-    if (sd_session_get_seat(name.c_str(), &seat) < 0 || !seat) {
-        return std::nullopt;
-    }
-    const std::string ownerSeat(seat);
-    std::free(seat);
-    if (ownerSeat.empty()) {
-        return std::nullopt;
-    }
-    return OwnerSession{name, ownerSeat, uid};
-}
-
-} // namespace
 
 // Only the QApplication thread may consume the native button action.
 // A packet, IPC message, CLI argument or other application thread cannot
@@ -198,8 +239,12 @@ extern "C" int opendrop_qt_take_guest_visibility_action() noexcept {
     try {
         auto *app = qobject_cast<QApplication *>(QCoreApplication::instance());
         if (!app || QThread::currentThread() != app->thread() ||
-            foregroundStop.load(std::memory_order_acquire) ||
-            !currentOwnerSession()) {
+            foregroundStop.load(std::memory_order_acquire)) {
+            return -1;
+        }
+        if (!supportedOwnerDisplay() || !currentOwnerSession()) {
+            pendingGuestVisibilityAction.store(0, std::memory_order_release);
+            updateGuestVisibilityControls(true);
             return -1;
         }
         return pendingGuestVisibilityAction.exchange(0, std::memory_order_acq_rel);
@@ -210,14 +255,7 @@ extern "C" int opendrop_qt_take_guest_visibility_action() noexcept {
 
 extern "C" void opendrop_qt_guest_visibility_available(int available) noexcept {
     try {
-        auto *app = qobject_cast<QApplication *>(QCoreApplication::instance());
-        if (app && guestVisibilityButton &&
-            QThread::currentThread() == app->thread()) {
-            guestVisibilityButton->setEnabled(available == 1);
-            if (guestVisibilityOffButton) {
-                guestVisibilityOffButton->setEnabled(available == 1);
-            }
-        }
+        updateGuestVisibilityControls(available == 1);
     } catch (...) {
         foregroundStop.store(true, std::memory_order_release);
     }
